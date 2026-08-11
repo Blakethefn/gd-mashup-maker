@@ -334,7 +334,11 @@ def _build_stem_track(
         return _pad_to(piece, duration)[:duration]
 
     def descriptor_source(desc):
-        return default_source if desc is None else desc.get("source", "primary")
+        if desc is None:
+            return default_source
+        # A muted clip silences its window: as a Replace clip that also
+        # silences the bed under it, which is how "silence audio" works.
+        return "muted" if desc.get("mute") else desc.get("source", "primary")
 
     def source_position(desc, source: str, timeline_ms: int) -> int:
         if desc is not None and "source_start_ms" in desc:
@@ -639,6 +643,9 @@ def stem_mix(
         gain = float(track.get("gain_db", 0.0) or 0.0)
         if abs(gain) > 0.01:
             built = built.apply_gain(gain)
+        pan = float(track.get("pan", 0.0) or 0.0)
+        if abs(pan) > 0.01:
+            built = built.pan(max(-1.0, min(1.0, pan)))
         final = built if final is None else final.overlay(built)
 
     return final if final is not None else AudioSegment.silent(duration=total_len)
