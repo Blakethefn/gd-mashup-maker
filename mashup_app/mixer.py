@@ -676,6 +676,9 @@ def stem_mix(
             bed, clips, sources, total_len,
             crossfade_ms=override_crossfade_ms, source_origins=origins,
         )
+        # A track's own effects run over its finished audio, so they reach the
+        # full-song bed as well as the clips sitting on it.
+        built = effects.apply_track_effects(built, track.get("effects"), total_len)
         gain = float(track.get("gain_db", 0.0) or 0.0)
         if abs(gain) > 0.01:
             built = built.apply_gain(gain)

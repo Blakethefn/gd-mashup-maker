@@ -388,6 +388,14 @@ def _apply_one(segment: AudioSegment, effect: dict) -> AudioSegment:
     return segment
 
 
+def apply_track_effects(segment: AudioSegment, effect_list, target_ms: int) -> AudioSegment:
+    """Run a whole track's effect chain over its finished audio - bed, clips
+    and all - without changing how long the track runs."""
+    if not effect_list:
+        return segment
+    return apply_clip_processing(segment, {"effects": effect_list}, target_ms)
+
+
 def apply_clip_processing(segment: AudioSegment, clip: dict, target_ms: int) -> AudioSegment:
     """Render a clip's speed, pitch and effect chain onto ``segment``.
 

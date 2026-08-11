@@ -377,6 +377,10 @@ class PlaylistEditor(tk.Canvas):
         self.sel_start_ms = 0.0
         self.sel_end_ms = 0.0
         self.selected_track_ids: list = []
+        # True when the selection means "these whole tracks" (a header click,
+        # a track's FX button, Select All) rather than "these clips". Effects
+        # need to tell the two apart to know what to attach to.
+        self.whole_tracks_selected = False
         self._zoom_toggle_span = None
 
         self.get_clip_length_ms = get_clip_length_ms or (lambda: 8000)
@@ -387,6 +391,7 @@ class PlaylistEditor(tk.Canvas):
         self.on_tool_change = on_tool_change
         self.on_track_command = on_track_command
         self.on_region = on_region
+        self.on_tracks_change = None
 
         self.undo_stack: list = []
         self.redo_stack: list = []
@@ -769,6 +774,7 @@ class PlaylistEditor(tk.Canvas):
     def select_all(self):
         self.selection = list(self.clips)
         self.selected_track_ids = [track["id"] for track in self.tracks]
+        self.whole_tracks_selected = True
         self.sel_start_ms, self.sel_end_ms = 0.0, float(self.total_ms)
         self._set_status(f"Selected all {len(self.selection)} clip(s) over the whole timeline")
         self._redraw()
@@ -777,6 +783,7 @@ class PlaylistEditor(tk.Canvas):
     def select_none(self):
         self.selection = []
         self.selected_track_ids = []
+        self.whole_tracks_selected = False
         self.sel_end_ms = self.sel_start_ms
         self._set_status("Selection cleared")
         self._redraw()
@@ -1408,12 +1415,29 @@ class PlaylistEditor(tk.Canvas):
     # ---- history ---------------------------------------------------------
 
     def _copy_clips(self):
-        return [dict(clip) for clip in self.clips]
+        # Tracks are part of the undoable state too: a track carries its own
+        # effects, bed, gain and pan, and undo has to be able to take those
+        # back the same way it takes back a clip edit.
+        return ([dict(clip) for clip in self.clips], [dict(track) for track in self.tracks])
 
     def _restore_snapshot(self, snapshot):
-        self.clips[:] = [dict(clip) for clip in snapshot]
+        clips, tracks = snapshot
+        self.clips[:] = [dict(clip) for clip in clips]
+        # Track state is restored into the existing dicts rather than onto
+        # fresh ones, so the row widgets and callbacks holding a reference to
+        # a track keep pointing at the live object after an undo.
+        existing = {track["id"]: track for track in self.tracks}
+        restored = []
+        for snapshot_track in tracks:
+            track = existing.get(snapshot_track["id"], {})
+            track.clear()
+            track.update(snapshot_track)
+            restored.append(track)
+        self.tracks[:] = restored
         self.selection = []
         self._redraw()
+        if self.on_tracks_change:
+            self.on_tracks_change()
 
     def _begin_transaction(self):
         if self._transaction_before is None:
@@ -1584,6 +1608,11 @@ class PlaylistEditor(tk.Canvas):
         gain = float(track.get("gain_db", 0.0) or 0.0)
         if abs(gain) > 0.05:
             self.create_text(60, top + 43, text=f"{gain:+.1f} dB", anchor="w", fill=MUTED, font=("Consolas", 7))
+        count = len(track.get("effects") or [])
+        if count:
+            self.create_rectangle(112, top + 36, 140, top + 50, fill=FX_BADGE, outline="")
+            self.create_text(126, top + 43, text=f"fx{count}" if count > 1 else "fx",
+                             fill=ACCENT_TEXT, font=("Segoe UI", 7, "bold"))
 
         self.create_line(self.HEADER_W - 22, top, self.HEADER_W - 22, bottom, fill="#20262f")
         lanes = _track_lanes(track)
@@ -1767,6 +1796,7 @@ class PlaylistEditor(tk.Canvas):
         }
         self.clips.append(clip)
         self.selection = [clip]
+        self.whole_tracks_selected = False
         self._drag_mode = "create"
         self._drag_anchor_ms = anchor
         self._drag_ref = clip
@@ -1788,6 +1818,7 @@ class PlaylistEditor(tk.Canvas):
                 self.selection.append(clip)
         elif not self._in_selection(clip):
             self.selection = [clip]
+        self.whole_tracks_selected = False
 
         self._begin_transaction()
         duplicating = bool(state & self.ALT_MASK) and kind == "move"
@@ -1926,6 +1957,23 @@ class PlaylistEditor(tk.Canvas):
         touched so the clip-level commands have something to work on."""
         x0, y0, x1, y1 = self._marquee
         self._marquee = None
+        if abs(x1 - x0) < 4 and abs(y1 - y0) < 4:
+            # A click, not a drag: select the track under the pointer and put
+            # the cursor there, so clicking a track always does something.
+            self._transaction_before = None
+            info = self._lane_info(y0)
+            if info is None:
+                return
+            index, track, _lane = info
+            self.active_track_id = track["id"]
+            self.selection = []
+            self.set_region(self._snap_point(self._x_to_ms(x0)), None, [track["id"]])
+            self.whole_tracks_selected = True
+            self._set_status(
+                f"'{track['name']}' selected at {self._fmt_precise(self.playhead_ms)} - "
+                f"drag to select part of it, or use its FX button for the whole track"
+            )
+            return
         left, right = sorted((self._x_to_ms(x0), self._x_to_ms(x1)))
         top, bottom = sorted((y0, y1))
         picked = []
@@ -1945,6 +1993,7 @@ class PlaylistEditor(tk.Canvas):
                 picked.append(clip)
         self.selection = picked
         self._transaction_before = None
+        self.whole_tracks_selected = False
         self.set_region(left, right, track_ids)
         self._set_status(
             f"Selected {self._fmt_precise(left)} - {self._fmt_precise(right)} "
@@ -2003,6 +2052,7 @@ class PlaylistEditor(tk.Canvas):
                 and self.tracks[self._track_index_of(clip)]["id"] in ids
             ]
             self._set_status(f"Selected track '{track['name']}'")
+        self.whole_tracks_selected = True
         self._drag_mode = None
         self._redraw()
 
@@ -2024,6 +2074,7 @@ class PlaylistEditor(tk.Canvas):
                 [self.tracks[index]["id"]] if index is not None else None,
             )
             self._set_status(f"Selected clip {self._range_text(clip)}")
+        self.whole_tracks_selected = False
         return "break"
 
     def _on_right_click(self, event):
@@ -3016,14 +3067,29 @@ class MashupApp(tk.Tk):
         down.pack(side="left", padx=1)
         self._tip(down, "Move this track down the playlist.")
 
+        count = len(track.get("effects") or [])
+        fx = ttk.Button(
+            row, text=f"FX ({count})" if count else "FX", style="Mini.TButton",
+            command=lambda: self._track_effect_menu(track),
+        )
+        fx.pack(side="left", padx=(6, 2))
+        self._tip(
+            fx,
+            "Apply an effect to this entire track - full-song bed included. "
+            "This is the way to process a whole part, with no clips needed.",
+        )
         ttk.Button(
             row, text="Duplicate", style="Mini.TButton", command=lambda: self._duplicate_track(track),
-        ).pack(side="left", padx=(6, 2))
+        ).pack(side="left", padx=(4, 2))
         ttk.Button(
             row, text="Remove", style="Mini.TButton", command=lambda: self._remove_track(track),
         ).pack(side="left", padx=2)
         kind = "audio file" if track["kind"] == "audio" else f"{track['stem']} stem"
-        ttk.Label(row, text=kind, style="Muted.TLabel").pack(side="left", padx=8)
+        summary = ", ".join(effects.describe(e) for e in track.get("effects") or [])
+        label = ttk.Label(row, text=summary or kind, style="Muted.TLabel")
+        label.pack(side="left", padx=8)
+        if summary:
+            self._tip(label, f"{kind} - {summary}")
 
     def _write_track_name(self, track, var):
         track["name"] = var.get()[:24]
@@ -3119,6 +3185,7 @@ class MashupApp(tk.Tk):
             on_track_command=self._on_track_command,
             on_region=self._show_region,
         )
+        self.playlist_editor.on_tracks_change = self._refresh_track_panel
         self.playlist_vscroll = ttk.Scrollbar(canvas_row, orient="vertical", command=self.playlist_editor.yview)
         self.playlist_vscroll.pack(side="right", fill="y")
         self.playlist_editor.pack(side="left", fill="x", expand=True)
@@ -3466,28 +3533,93 @@ class MashupApp(tk.Tk):
 
     # ---- effects ----------------------------------------------------------
 
-    def _effect_targets(self):
-        """What an effect applies to, following Audacity: the selected region
-        on the selected tracks if there is one (split out first so the effect
-        lands only inside it), otherwise the selected clips."""
+    def _effect_scope(self):
+        """Decide what an effect acts on.
+
+        Returns ("tracks", [...]) or ("clips", [...]) or ("none", []).
+
+        Whole tracks are the common case - "make all of Vocals sound like
+        this" - and they are what you get by clicking a track header or its
+        FX button. A track effect runs over the finished track, so it reaches
+        the full-song bed, which no clip-level effect can do.
+
+        A part-of-a-track region falls back to clips, materialising the bed
+        into a real clip wherever the region is not already covered by one.
+        """
         editor = self.playlist_editor
+        chosen = [t for t in self.timeline_tracks if t["id"] in editor.selected_track_ids]
+        if chosen and editor.whole_tracks_selected:
+            return "tracks", chosen
         if editor.has_region():
-            start, end = editor.region()
-            editor._begin_transaction()
-            inside = editor._split_edges(
-                [clip for clip, _t in editor._clips_in_region()], start, end
-            )
-            if inside:
-                editor.selection = inside
-                return inside
-            editor._transaction_before = None
-        return list(editor.selection)
+            return "clips", self._materialize_region(chosen or editor.selected_tracks())
+        if editor.selection:
+            return "clips", list(editor.selection)
+        return "none", []
+
+    @staticmethod
+    def _uncovered(start, end, covered):
+        """The parts of [start, end) that no clip already occupies."""
+        gaps = []
+        cursor = start
+        for piece_start, piece_end in sorted(covered):
+            if piece_start > cursor:
+                gaps.append((cursor, min(piece_start, end)))
+            cursor = max(cursor, piece_end)
+            if cursor >= end:
+                break
+        if cursor < end:
+            gaps.append((cursor, end))
+        return [(a, b) for a, b in gaps if b - a >= PlaylistEditor.MIN_LEN_MS]
+
+    @staticmethod
+    def _bed_lanes(track):
+        """The clips it takes to reproduce a track's bed. A "both" bed needs
+        two: one replacing the bed with primary, one layering secondary back
+        on top, which is exactly what the bed itself was doing."""
+        bed = track.get("bed", "muted")
+        if bed == "muted":
+            return []
+        if bed == "both":
+            return [("primary", "replace"), ("secondary", "layer")]
+        return [(bed, "replace")]
+
+    def _materialize_region(self, tracks):
+        """Give an effect something to attach to inside the region: split the
+        clips that are already there, and turn an audible bed into a real clip
+        over whatever the region does not yet cover."""
+        editor = self.playlist_editor
+        start, end = editor.region()
+        editor._begin_transaction()
+        pieces = editor._split_edges(
+            [clip for clip, _t in editor._clips_in_region(tracks)], start, end
+        )
+        offset_ms = int(self.stems_offset.get())
+        for track in tracks:
+            for lane, mode in self._bed_lanes(track):
+                covered = [
+                    (int(p["start_ms"]), int(p["end_ms"])) for p in pieces
+                    if p.get("track") == track["id"] and p.get("source") == lane
+                ]
+                # The bed plays its source aligned to timeline time, so a clip
+                # reproducing it needs an in-point that undoes the lane's origin.
+                origin = offset_ms if lane == "secondary" else 0
+                for gap_start, gap_end in self._uncovered(start, end, covered):
+                    clip = {
+                        "track": track["id"], "stem": track.get("stem"), "source": lane,
+                        "start_ms": int(gap_start), "end_ms": int(gap_end),
+                        "source_start_ms": int(gap_start) - origin, "mode": mode,
+                    }
+                    self.stem_overrides.append(clip)
+                    pieces.append(clip)
+        editor.selection = pieces
+        return pieces
 
     def _apply_effect(self, effect_type):
-        targets = self._effect_targets()
-        if not targets:
+        kind, targets = self._effect_scope()
+        if kind == "none":
             self.override_status_var.set(
-                "Select a region or some clips first, then pick an effect"
+                "Nothing selected - click a track header (or its FX button) for the whole track, "
+                "or drag a region for part of one"
             )
             return
         params = (
@@ -3498,40 +3630,64 @@ class MashupApp(tk.Tk):
             self.playlist_editor._cancel_interaction()
             return
         entry = {"type": effect_type, **params}
-        self.playlist_editor._begin_transaction()
-        for clip in targets:
-            clip.setdefault("effects", []).append(dict(entry))
         self._last_effect = entry
-        self.playlist_editor._commit_transaction(
-            f"{effects.describe(entry)} on {len(targets)} clip(s)"
-        )
+        self._attach_effect(kind, targets, entry, effects.describe(entry))
 
     def _repeat_last_effect(self):
         if not self._last_effect:
             self.override_status_var.set("No effect to repeat yet")
             return
-        targets = self._effect_targets()
-        if not targets:
-            self.override_status_var.set("Select a region or some clips first")
+        kind, targets = self._effect_scope()
+        if kind == "none":
+            self.override_status_var.set("Select a track or a region first")
             return
-        self.playlist_editor._begin_transaction()
-        for clip in targets:
-            clip.setdefault("effects", []).append(dict(self._last_effect))
-        self.playlist_editor._commit_transaction(
-            f"Repeated {effects.describe(self._last_effect)} on {len(targets)} clip(s)"
+        self._attach_effect(
+            kind, targets, self._last_effect, f"Repeated {effects.describe(self._last_effect)}"
         )
 
+    def _attach_effect(self, kind, targets, entry, message):
+        self.playlist_editor._begin_transaction()
+        for target in targets:
+            target.setdefault("effects", []).append(dict(entry))
+        noun = "track" if kind == "tracks" else "clip"
+        self.playlist_editor._commit_transaction(
+            f"{message} on {len(targets)} {noun}{'s' if len(targets) != 1 else ''}"
+        )
+        if kind == "tracks":
+            self._refresh_track_panel()
+
     def _clear_effects(self):
-        targets = list(self.playlist_editor.selection)
-        if not targets:
-            self.override_status_var.set("Select clips to clear their effects")
+        kind, targets = self._effect_scope()
+        if kind == "none":
+            self.override_status_var.set("Select a track or some clips to clear their effects")
             return
         self.playlist_editor._begin_transaction()
-        for clip in targets:
-            clip.pop("effects", None)
-            clip.pop("speed", None)
-            clip.pop("pitch", None)
-        self.playlist_editor._commit_transaction(f"Cleared effects on {len(targets)} clip(s)")
+        for target in targets:
+            target.pop("effects", None)
+            target.pop("speed", None)
+            target.pop("pitch", None)
+            target.pop("preserve_formants", None)
+        noun = "track" if kind == "tracks" else "clip"
+        self.playlist_editor._commit_transaction(
+            f"Cleared effects on {len(targets)} {noun}{'s' if len(targets) != 1 else ''}"
+        )
+        if kind == "tracks":
+            self._refresh_track_panel()
+
+    def _track_effect_menu(self, track):
+        """The FX button on a track row: select that whole track, then offer
+        the effect menu so the choice lands on the track itself."""
+        editor = self.playlist_editor
+        editor.active_track_id = track["id"]
+        editor.selection = []
+        editor.set_region(0, editor.total_ms, [track["id"]])
+        editor.whole_tracks_selected = True
+        self.override_status_var.set(f"Effects will apply to all of '{track['name']}'")
+        menu = self._build_effect_menu()
+        try:
+            menu.tk_popup(self.winfo_pointerx(), self.winfo_pointery())
+        finally:
+            menu.grab_release()
 
     def _ask_effect_params(self, effect_type):
         """Modal parameter form built from the effect's own spec. Returns the
