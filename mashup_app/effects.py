@@ -110,6 +110,7 @@ EFFECT_SPECS = {
         "params": [
             ("semitones", "Semitones (half-steps)", -24.0, 24.0, 1.0, 0.0),
             ("high_quality", "High quality (slow): 1 = on", 0.0, 1.0, 1.0, 0.0),
+            ("preserve_formants", "Optimize for voice: 1 = on", 0.0, 1.0, 1.0, 0.0),
         ],
         "summary": "{semitones:+g} st",
     },
@@ -247,7 +248,47 @@ def _stretch(segment: AudioSegment, rate: float) -> AudioSegment:
     return mastering.apply_stereo(segment, stretch_channel)
 
 
-def _shift_pitch(segment: AudioSegment, semitones: float, high_quality: bool = False) -> AudioSegment:
+def _cepstral_envelope(magnitude, order: int = 40):
+    """Smooth spectral envelope per frame - the formants, with the harmonics
+    liftered away. Low quefrencies describe the resonating body; high ones
+    describe the pitch that is exciting it."""
+    import numpy as np
+
+    log_magnitude = np.log(magnitude + 1e-10)
+    cepstrum = np.fft.irfft(log_magnitude, axis=0)
+    cepstrum[order:-order] = 0.0
+    return np.exp(np.real(np.fft.rfft(cepstrum, axis=0)))
+
+
+def _restore_formants(original, shifted, sr: int):
+    """Put the original's formants back on a pitch-shifted signal.
+
+    Shifting pitch naively drags the vocal tract's resonances along with it,
+    which is what makes a transposed voice sound like a chipmunk or an ogre.
+    Dividing out the shifted envelope and re-imposing the original one moves
+    the pitch while leaving the voice sounding like the same person.
+    """
+    import librosa
+    import numpy as np
+
+    n_fft, hop = 2048, 512
+    if len(shifted) < n_fft:
+        return shifted
+    spectrum_shifted = librosa.stft(shifted, n_fft=n_fft, hop_length=hop)
+    spectrum_original = librosa.stft(original[: len(shifted)], n_fft=n_fft, hop_length=hop)
+    frames = min(spectrum_shifted.shape[1], spectrum_original.shape[1])
+    spectrum_shifted = spectrum_shifted[:, :frames]
+    envelope_original = _cepstral_envelope(np.abs(spectrum_original[:, :frames]))
+    envelope_shifted = _cepstral_envelope(np.abs(spectrum_shifted))
+    gain = np.clip(envelope_original / (envelope_shifted + 1e-10), 0.05, 20.0)
+    corrected = librosa.istft(spectrum_shifted * gain, hop_length=hop, length=len(shifted))
+    return corrected.astype(np.float32)
+
+
+def _shift_pitch(
+    segment: AudioSegment, semitones: float, high_quality: bool = False,
+    preserve_formants: bool = False,
+) -> AudioSegment:
     if abs(semitones) <= 1e-6 or len(segment) == 0:
         return segment
     import librosa
@@ -255,12 +296,18 @@ def _shift_pitch(segment: AudioSegment, semitones: float, high_quality: bool = F
     def shift_channel(y, sr):
         # res_type is only honoured by newer librosa; fall back to its default.
         try:
-            return librosa.effects.pitch_shift(
+            shifted = librosa.effects.pitch_shift(
                 y, sr=sr, n_steps=semitones,
                 res_type="soxr_hq" if high_quality else "soxr_qq",
             )
         except TypeError:
-            return librosa.effects.pitch_shift(y, sr=sr, n_steps=semitones)
+            shifted = librosa.effects.pitch_shift(y, sr=sr, n_steps=semitones)
+        if preserve_formants:
+            try:
+                shifted = _restore_formants(y, shifted, sr)
+            except Exception:  # noqa: BLE001 - fall back to the plain shift
+                pass
+        return shifted
 
     return mastering.apply_stereo(segment, shift_channel)
 
@@ -334,7 +381,9 @@ def _apply_one(segment: AudioSegment, effect: dict) -> AudioSegment:
         )
     if kind == "change_pitch":
         return _shift_pitch(
-            segment, float(params["semitones"]), bool(float(params.get("high_quality", 0.0)))
+            segment, float(params["semitones"]),
+            bool(float(params.get("high_quality", 0.0))),
+            bool(float(params.get("preserve_formants", 0.0))),
         )
     return segment
 
@@ -346,7 +395,10 @@ def apply_clip_processing(segment: AudioSegment, clip: dict, target_ms: int) -> 
     target_ms long, so the clip keeps the slot the editor drew for it.
     """
     out = _stretch(segment, clip_speed(clip))
-    out = _shift_pitch(out, float(clip.get("pitch", 0.0) or 0.0))
+    out = _shift_pitch(
+        out, float(clip.get("pitch", 0.0) or 0.0),
+        preserve_formants=bool(clip.get("preserve_formants")),
+    )
     out = _fit(out, target_ms)
     for effect in clip.get("effects") or []:
         try:

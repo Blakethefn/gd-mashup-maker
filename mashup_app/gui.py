@@ -3178,9 +3178,11 @@ class MashupApp(tk.Tk):
                  "[ and ] jump clip boundaries. Arrows nudge, Alt+arrows slip source audio, up/down move lanes, "
                  "middle-drag pans, Ctrl+wheel zooms, wheel scrolls tracks. Click a track header to select the "
                  "whole track, double-click a clip to select it, drag a region edge to adjust it. The Effect "
-                 "menu applies amplify, normalize, fades, reverse, echo, reverb, EQ, filters, compression and "
-                 "per-clip pitch/speed to the region or the selected clips; Ctrl+R repeats the last one. "
-                 "Right-click for the full menu; the menu bar lists every command.",
+                 "menu applies amplify, normalize, fades, reverse, echo, reverb, EQ, filters and compression to "
+                 "the region or the selected clips; Ctrl+R repeats the last one. Pitch is there too: semitones "
+                 "and cents per clip, one-click semitone and octave shifts, and Optimize for Voice, which keeps "
+                 "a transposed vocal sounding like the same singer. Right-click for the full menu; the menu bar "
+                 "lists every command.",
             style="Muted.TLabel", wraplength=680, justify="left",
         ).pack(fill="x", padx=6, pady=(2, 6))
 
@@ -3239,6 +3241,8 @@ class MashupApp(tk.Tk):
         pitch = float(clip.get("pitch", 0.0) or 0.0)
         if abs(pitch) > 1e-6:
             parts.append(f"{pitch:+g} st")
+        if clip.get("preserve_formants"):
+            parts.append("voice")
         parts.extend(effects.describe(effect) for effect in clip.get("effects") or [])
         return ", ".join(parts)
 
@@ -3587,63 +3591,116 @@ class MashupApp(tk.Tk):
         return result or None
 
     def _ask_clip_speed_pitch(self):
-        """Audacity 3.7's per-clip pitch and speed, on the selected clips."""
+        """Audacity 3.7's Pitch and Speed dialog, on the selected clips.
+
+        Same shape as Audacity's: pitch as semitones plus cents, speed as a
+        percentage, and one general option - Optimize for Voice, which keeps
+        the formants put so a transposed vocal still sounds like the singer
+        rather than a chipmunk.
+        """
         targets = list(self.playlist_editor.selection)
         if not targets:
             self.override_status_var.set("Select clips to change their pitch or speed")
             return
         first = targets[0]
+        pitch = float(first.get("pitch", 0.0) or 0.0)
 
         dialog = tk.Toplevel(self)
-        dialog.title("Clip pitch and speed")
+        dialog.title("Pitch and Speed")
         dialog.configure(bg=BG)
         dialog.transient(self)
         dialog.resizable(False, False)
+
+        semitone_var = tk.IntVar(value=int(pitch))
+        cents_var = tk.IntVar(value=int(round((pitch - int(pitch)) * 100)))
+        speed_var = tk.DoubleVar(value=round(float(first.get("speed", 1.0) or 1.0) * 100.0, 3))
+        voice_var = tk.BooleanVar(value=bool(first.get("preserve_formants")))
+        follow_var = tk.BooleanVar(value=False)
+        guard = {"busy": False}
+
+        def carry_cents(*_a):
+            """Keep cents inside +/-100 by rolling whole steps into semitones,
+            and keep the two halves' signs consistent, as Audacity does."""
+            if guard["busy"]:
+                return
+            try:
+                semitones, cents = semitone_var.get(), cents_var.get()
+            except tk.TclError:
+                return
+            total = semitones * 100 + cents
+            guard["busy"] = True
+            try:
+                semitone_var.set(int(total / 100))
+                cents_var.set(int(total - int(total / 100) * 100))
+            finally:
+                guard["busy"] = False
+
+        pitch_box = ttk.LabelFrame(dialog, text=" Clip Pitch ")
+        pitch_box.pack(fill="x", padx=14, pady=(14, 6))
+        row = ttk.Frame(pitch_box)
+        row.pack(fill="x", padx=8, pady=8)
+        ttk.Label(row, text="semitones:").pack(side="left")
+        ttk.Spinbox(row, from_=-48, to=48, increment=1, textvariable=semitone_var,
+                    width=6).pack(side="left", padx=(4, 14))
+        ttk.Label(row, text="cents:").pack(side="left")
+        ttk.Spinbox(row, from_=-100, to=100, increment=1, textvariable=cents_var,
+                    width=6).pack(side="left", padx=4)
+        cents_var.trace_add("write", carry_cents)
+
+        speed_box = ttk.LabelFrame(dialog, text=" Clip Speed ")
+        speed_box.pack(fill="x", padx=14, pady=6)
+        speed_row = ttk.Frame(speed_box)
+        speed_row.pack(fill="x", padx=8, pady=8)
+        ttk.Label(speed_row, text="speed %:").pack(side="left")
+        ttk.Spinbox(speed_row, from_=25.0, to=400.0, increment=5.0, textvariable=speed_var,
+                    width=8).pack(side="left", padx=4)
+        ttk.Label(speed_row, text="(100 = unchanged)", style="Muted.TLabel").pack(side="left", padx=6)
+
+        general = ttk.LabelFrame(dialog, text=" General ")
+        general.pack(fill="x", padx=14, pady=6)
+        voice = ttk.Checkbutton(general, text="Optimize for Voice", variable=voice_var)
+        voice.pack(anchor="w", padx=8, pady=(8, 2))
+        self._tip(
+            voice,
+            "Keeps the vocal formants where they are, so a transposed voice still sounds like the "
+            "same singer instead of a chipmunk. Slower to render.",
+        )
+        ttk.Checkbutton(
+            general, text="Let pitch follow speed (classic tape-style change speed)",
+            variable=follow_var,
+        ).pack(anchor="w", padx=8, pady=(0, 8))
+
         ttk.Label(
             dialog,
-            text="Speed stretches the clip's source audio inside the slot it already occupies, "
-                 "so the timeline layout never shifts. Pitch is independent of it.",
+            text="Speed stretches the clip's source audio inside the slot it already occupies, so the "
+                 "timeline layout never shifts.",
             style="Muted.TLabel", wraplength=360,
-        ).pack(fill="x", padx=14, pady=(14, 8))
-
-        body = ttk.Frame(dialog)
-        body.pack(fill="x", padx=14)
-        body.columnconfigure(1, weight=1)
-        speed_var = tk.DoubleVar(value=float(first.get("speed", 1.0) or 1.0))
-        pitch_var = tk.DoubleVar(value=float(first.get("pitch", 0.0) or 0.0))
-        follow_var = tk.BooleanVar(value=False)
-        ttk.Label(body, text="Speed (1.0 = unchanged)").grid(row=0, column=0, sticky="w", pady=4)
-        ttk.Spinbox(body, from_=0.25, to=4.0, increment=0.05, textvariable=speed_var,
-                    width=10).grid(row=0, column=1, sticky="e", pady=4)
-        ttk.Label(body, text="Pitch (semitones)").grid(row=1, column=0, sticky="w", pady=4)
-        ttk.Spinbox(body, from_=-24.0, to=24.0, increment=1.0, textvariable=pitch_var,
-                    width=10).grid(row=1, column=1, sticky="e", pady=4)
-        ttk.Checkbutton(
-            body, text="Let pitch follow speed (classic tape-style change speed)",
-            variable=follow_var,
-        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(8, 2))
+        ).pack(fill="x", padx=14, pady=(0, 4))
 
         def confirm():
             try:
-                speed = max(0.25, min(4.0, float(speed_var.get())))
-                pitch = max(-24.0, min(24.0, float(pitch_var.get())))
+                speed = max(0.25, min(4.0, float(speed_var.get()) / 100.0))
+                semitones = semitone_var.get() + cents_var.get() / 100.0
             except (tk.TclError, ValueError):
                 dialog.destroy()
                 return
             if follow_var.get():
                 # Resampling by r shifts pitch by 12*log2(r) as well as timing.
-                pitch = 12.0 * math.log2(speed)
+                semitones = 12.0 * math.log2(speed)
+            semitones = max(-48.0, min(48.0, semitones))
             self.playlist_editor._begin_transaction()
             for clip in targets:
                 clip["speed"] = speed
-                clip["pitch"] = pitch
+                clip["pitch"] = semitones
+                clip["preserve_formants"] = bool(voice_var.get())
             self.playlist_editor._commit_transaction(
-                f"Speed {speed:g}x, pitch {pitch:+.1f} on {len(targets)} clip(s)"
+                f"Speed {speed * 100:g}%, pitch {semitones:+.2f} st"
+                f"{', voice' if voice_var.get() else ''} on {len(targets)} clip(s)"
             )
             dialog.destroy()
 
         buttons = ttk.Frame(dialog)
-        buttons.pack(fill="x", padx=14, pady=(12, 14))
+        buttons.pack(fill="x", padx=14, pady=(8, 14))
         ttk.Button(buttons, text="Cancel", command=dialog.destroy).pack(side="right")
         ttk.Button(buttons, text="Apply", style="Accent.TButton",
                    command=confirm).pack(side="right", padx=6)
@@ -3656,6 +3713,33 @@ class MashupApp(tk.Tk):
         )
         dialog.grab_set()
         self.wait_window(dialog)
+
+    def _nudge_clip_pitch(self, semitones):
+        """One-click semitone moves, for when the dialog is more than you need."""
+        targets = list(self.playlist_editor.selection)
+        if not targets:
+            self.override_status_var.set("Select clips to shift their pitch")
+            return
+        self.playlist_editor._begin_transaction()
+        for clip in targets:
+            clip["pitch"] = max(-48.0, min(48.0, float(clip.get("pitch", 0.0) or 0.0) + semitones))
+        self.playlist_editor._commit_transaction(
+            f"Pitch {semitones:+g} st on {len(targets)} clip(s)"
+        )
+
+    def _toggle_voice_optimization(self):
+        targets = list(self.playlist_editor.selection)
+        if not targets:
+            self.override_status_var.set("Select clips to optimize for voice")
+            return
+        target = not all(clip.get("preserve_formants") for clip in targets)
+        self.playlist_editor._begin_transaction()
+        for clip in targets:
+            clip["preserve_formants"] = target
+        self.playlist_editor._commit_transaction(
+            ("Optimizing for voice on " if target else "Plain pitch shift on ")
+            + f"{len(targets)} clip(s)"
+        )
 
     # ---- pitch --------------------------------------------------------------
 
@@ -3689,6 +3773,7 @@ class MashupApp(tk.Tk):
         to_hz = tk.StringVar(value="440.000")
         percent_var = tk.DoubleVar(value=0.0)
         quality_var = tk.BooleanVar(value=False)
+        voice_var = tk.BooleanVar(value=False)
 
         def refresh():
             """Rewrite every field from the canonical from-pitch + semitones."""
@@ -3809,6 +3894,13 @@ class MashupApp(tk.Tk):
 
         ttk.Checkbutton(body, text="Use high quality stretching (slow)",
                         variable=quality_var).pack(anchor="w", pady=(8, 0))
+        voice = ttk.Checkbutton(body, text="Optimize for Voice", variable=voice_var)
+        voice.pack(anchor="w", pady=(2, 0))
+        self._tip(
+            voice,
+            "Keeps the vocal formants where they are, so a transposed voice still sounds like the "
+            "same singer instead of a chipmunk. Slower to render.",
+        )
 
         for var, handler in (
             (from_note, on_from_note), (from_octave, on_from_note),
@@ -3823,6 +3915,7 @@ class MashupApp(tk.Tk):
         def confirm():
             chosen["semitones"] = round(state["semitones"], 4)
             chosen["high_quality"] = 1.0 if quality_var.get() else 0.0
+            chosen["preserve_formants"] = 1.0 if voice_var.get() else 0.0
             dialog.destroy()
 
         buttons = ttk.Frame(dialog)
@@ -3936,6 +4029,12 @@ class MashupApp(tk.Tk):
             menu.add_command(label=spec["label"], command=lambda e=entry: self._apply_effect(e))
         menu.add_separator()
         menu.add_command(label="Clip pitch and speed...", command=self._ask_clip_speed_pitch)
+        semitone_menu = self._menu()
+        for label, steps in (("Up a semitone", 1), ("Down a semitone", -1),
+                             ("Up an octave", 12), ("Down an octave", -12)):
+            semitone_menu.add_command(label=label, command=lambda s=steps: self._nudge_clip_pitch(s))
+        menu.add_cascade(label="Shift clip pitch", menu=semitone_menu)
+        menu.add_command(label="Optimize for Voice on/off", command=self._toggle_voice_optimization)
         menu.add_command(label="Match clip pitch to primary's key",
                          command=self._match_clip_pitch_to_key)
         menu.add_command(label="Remove all effects from clips", command=self._clear_effects)
