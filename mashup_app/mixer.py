@@ -3,7 +3,7 @@ from typing import Callable, Dict, Optional
 
 from pydub import AudioSegment
 
-from . import analysis, audio_io, mastering, separation
+from . import analysis, audio_io, effects, mastering, separation
 
 
 def simple_overlay(
@@ -342,27 +342,63 @@ def _build_stem_track(
 
     def source_position(desc, source: str, timeline_ms: int) -> int:
         if desc is not None and "source_start_ms" in desc:
-            return origins[source] + int(desc["source_start_ms"]) + (timeline_ms - int(desc["start_ms"]))
+            # A sped-up clip eats more source per millisecond of timeline.
+            offset = (timeline_ms - int(desc["start_ms"])) * effects.clip_speed(desc)
+            return origins[source] + int(desc["source_start_ms"]) + int(round(offset))
         # Old overrides and the default bed are aligned to final timeline
         # time, including secondary's start-offset padding.
         return timeline_ms
 
-    def slice_descriptor(desc, start_ms: int, end_ms: int) -> AudioSegment:
+    def silence(duration: int) -> AudioSegment:
+        return (
+            AudioSegment.silent(duration=duration, frame_rate=reference.frame_rate)
+            .set_channels(reference.channels)
+            .set_sample_width(reference.sample_width)
+        )
+
+    def raw_slice(desc, start_ms: int, end_ms: int, speed: float = 1.0) -> AudioSegment:
         duration = max(0, end_ms - start_ms)
+        source_len = max(0, int(round(duration * speed)))
         mixed = None
         for source in source_names(descriptor_source(desc)):
             source_start = source_position(desc, source, start_ms)
-            piece = slice_padded(sources[source], source_start, source_start + duration)
+            piece = slice_padded(sources[source], source_start, source_start + source_len)
             mixed = piece if mixed is None else mixed.overlay(piece)
         if mixed is None:
-            mixed = (
-                AudioSegment.silent(duration=duration, frame_rate=reference.frame_rate)
-                .set_channels(reference.channels)
-                .set_sample_width(reference.sample_width)
-            )
-        return _pad_to(mixed, duration)[:duration]
+            mixed = silence(source_len)
+        return _pad_to(mixed, source_len)[:source_len]
+
+    # A clip carrying speed/pitch/effects is rendered once across its whole
+    # destination window and then indexed into, so an effect that needs the
+    # entire clip (a fade, a reverse, a reverb tail) is not re-applied to each
+    # crossfade sub-slice.
+    processed_cache: Dict[int, AudioSegment] = {}
+
+    def processed_clip(desc) -> AudioSegment:
+        cached = processed_cache.get(id(desc))
+        if cached is not None:
+            return cached
+        start, end = int(desc["start_ms"]), int(desc["end_ms"])
+        duration = max(0, end - start)
+        rendered = effects.apply_clip_processing(
+            raw_slice(desc, start, end, effects.clip_speed(desc)), desc, duration
+        )
+        processed_cache[id(desc)] = rendered
+        return rendered
+
+    def slice_descriptor(desc, start_ms: int, end_ms: int) -> AudioSegment:
+        duration = max(0, end_ms - start_ms)
+        if desc is not None and effects.has_processing(desc):
+            offset = max(0, start_ms - int(desc["start_ms"]))
+            piece = processed_clip(desc)[offset:offset + duration]
+            return _pad_to(piece, duration)[:duration]
+        return _pad_to(raw_slice(desc, start_ms, end_ms), duration)[:duration]
 
     def descriptor_key(desc):
+        # Two neighbouring regions share a key only when the same source audio
+        # runs continuously across the join, so no crossfade is needed there.
+        if desc is not None and effects.has_processing(desc):
+            return ("processed", id(desc))
         source = descriptor_source(desc)
         offsets = []
         for name in source_names(source):

@@ -1,6 +1,7 @@
 """Tkinter GUI: pick two MP3s, choose a mashup mode, tweak its controls, render."""
 import itertools
 import json
+import math
 import os
 import queue
 import threading
@@ -8,7 +9,7 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
-from . import mixer
+from . import effects, mixer
 
 MODE_SIMPLE = "Simple Overlay/Crossfade"
 MODE_BEAT_SYNCED = "Beat-Synced Blend"
@@ -67,6 +68,7 @@ PLAYHEAD_COLOR = "#ff6b4a"
 REGION_FILL = "#9ecbff"
 REGION_EDGE = "#5aa9f0"
 MUTED_CLIP = "#464e5b"
+FX_BADGE = "#ffd75e"
 MODE_COLORS = {"layer": "#5fd68a", "replace": "#ff7b72"}
 
 STEM_LANES = ("primary", "secondary")
@@ -1682,6 +1684,15 @@ class PlaylistEditor(tk.Canvas):
             label = f"{self._clip_mode(clip).upper()}  IN {self._fmt_precise(self._clip_source_start(clip))}"
             self.create_text(x0 + 7, top + 3, text=label, anchor="nw", fill="white",
                              font=("Segoe UI", 7, "bold"))
+        if effects.has_processing(clip) and x1 - x0 > 26:
+            badge = "fx"
+            count = len(clip.get("effects") or [])
+            if count > 1:
+                badge = f"fx{count}"
+            self.create_rectangle(x1 - 22, bottom - 12, x1 - 3, bottom - 2,
+                                  fill=FX_BADGE, outline="")
+            self.create_text((x1 - 12.5), bottom - 7, text=badge, fill=ACCENT_TEXT,
+                             font=("Segoe UI", 6, "bold"))
 
     def _draw_feedback(self, x, y, text):
         use_right_anchor = x > self.winfo_width() * 0.62
@@ -1710,9 +1721,18 @@ class PlaylistEditor(tk.Canvas):
             return
         if event.y < self.RULER_H:
             # Dragging the ruler selects a time range, as in Audacity's
-            # timeline; a plain click collapses it to the cursor.
+            # timeline; a plain click collapses it to the cursor. Grabbing an
+            # existing edge adjusts that end instead of starting over.
             self._drag_mode = "scrub"
-            self._drag_anchor_ms = self._snap_point(self._x_to_ms(event.x), event)
+            here = self._x_to_ms(event.x)
+            edge = self._region_edge_at(event.x)
+            if edge is not None:
+                start, end = self.region()
+                self._drag_anchor_ms = end if edge == "start" else start
+                self.set_region(self._drag_anchor_ms, here)
+                self._set_status("Adjusting the region edge")
+                return
+            self._drag_anchor_ms = self._snap_point(here, event)
             self.set_region(self._drag_anchor_ms)
             self._set_status(f"Cursor {self._fmt_precise(self._drag_anchor_ms)}")
             return
@@ -1947,6 +1967,16 @@ class PlaylistEditor(tk.Canvas):
         self._feedback = None
         self._commit_transaction(f"Cut clip at {self._fmt_precise(split_ms)}")
 
+    def _region_edge_at(self, x):
+        """Which region edge (if either) the pointer is grabbing in the ruler."""
+        if not self.has_region():
+            return None
+        start, end = self.region()
+        for name, ms in (("start", start), ("end", end)):
+            if abs(x - self._ms_to_x(ms)) <= self.EDGE_PX:
+                return name
+        return None
+
     def _press_header(self, event):
         for x0, y0, x1, y1, key, track in self._header_hits:
             if x0 <= event.x <= x1 and y0 <= event.y <= y1:
@@ -1958,7 +1988,21 @@ class PlaylistEditor(tk.Canvas):
                 return
         index = self._track_at(event.y)
         if index is not None:
-            self.active_track_id = self.tracks[index]["id"]
+            # Clicking a track's header selects that whole track, the way
+            # Audacity's track control panel does.
+            track = self.tracks[index]
+            self.active_track_id = track["id"]
+            additive = bool(getattr(event, "state", 0) & (self.CTRL_MASK | self.SHIFT_MASK))
+            ids = list(self.selected_track_ids) if additive else []
+            if track["id"] not in ids:
+                ids.append(track["id"])
+            self.set_region(0, self.total_ms, ids)
+            self.selection = [
+                clip for clip in self.clips
+                if self._track_index_of(clip) is not None
+                and self.tracks[self._track_index_of(clip)]["id"] in ids
+            ]
+            self._set_status(f"Selected track '{track['name']}'")
         self._drag_mode = None
         self._redraw()
 
@@ -1970,11 +2014,16 @@ class PlaylistEditor(tk.Canvas):
             return "break"
         hit = self._hit_test(event)
         if hit is not None:
+            # Audacity selects the whole clip on a double-click; the
+            # Layer/Replace toggle lives in the right-click menu.
             clip = hit[1]
-            self._begin_transaction()
-            clip["mode"] = "replace" if self._clip_mode(clip) == "layer" else "layer"
+            index = self._track_index_of(clip)
             self.selection = [clip]
-            self._commit_transaction(f"Clip set to {clip['mode'].capitalize()}")
+            self.set_region(
+                clip["start_ms"], clip["end_ms"],
+                [self.tracks[index]["id"]] if index is not None else None,
+            )
+            self._set_status(f"Selected clip {self._range_text(clip)}")
         return "break"
 
     def _on_right_click(self, event):
@@ -2091,8 +2140,13 @@ class PlaylistEditor(tk.Canvas):
             return
         if event.y < self.RULER_H:
             ms = self._snap_point(self._x_to_ms(event.x), event)
-            self.configure(cursor="hand2")
-            self._set_feedback(event.x, self.RULER_H + 24, f"Playhead {self._fmt_precise(ms)}")
+            on_edge = self._region_edge_at(event.x)
+            self.configure(cursor="sb_h_double_arrow" if on_edge else "hand2")
+            self._set_feedback(
+                event.x, self.RULER_H + 24,
+                f"Drag the region {on_edge}" if on_edge
+                else f"Cursor {self._fmt_precise(ms)} - drag to select a region",
+            )
             self._redraw()
             return
         info = self._lane_info(event.y)
@@ -2258,6 +2312,7 @@ class MashupApp(tk.Tk):
         self._track_vars: dict = {}
         self._imported_durations: dict = {}
         self._syncing_clip_list = False
+        self._last_effect = None
         self.override_tool_var = tk.StringVar(value="select")
         self.override_clip_length_var = tk.DoubleVar(value=8.0)
         self.override_clip_mode_var = tk.StringVar(value="Layer")
@@ -2288,8 +2343,9 @@ class MashupApp(tk.Tk):
         self._build_status_row()
         self._build_action_buttons()
 
+        self._bind_global_shortcuts()
         self._show_mode_frame()
-        self._center_window(800, 780)
+        self._center_window(1000, 820)
         self.after(100, self._poll_queue)
 
     # ---- theme & layout scaffolding ----------------------------------
@@ -3118,18 +3174,22 @@ class MashupApp(tk.Tk):
                  "delete-and-gap / Ctrl+J join. Ctrl+D duplicates to a new track, Ctrl+Shift+D in place, "
                  "Alt-drag drags a copy, Ctrl+C/X/V copy-paste at the cursor, S splits at the playhead, "
                  "[ and ] jump clip boundaries. Arrows nudge, Alt+arrows slip source audio, up/down move lanes, "
-                 "middle-drag pans, Ctrl+wheel zooms, wheel scrolls tracks. Right-click for the full menu; the "
-                 "menu bar lists every command.",
+                 "middle-drag pans, Ctrl+wheel zooms, wheel scrolls tracks. Click a track header to select the "
+                 "whole track, double-click a clip to select it, drag a region edge to adjust it. The Effect "
+                 "menu applies amplify, normalize, fades, reverse, echo, reverb, EQ, filters, compression and "
+                 "per-clip pitch/speed to the region or the selected clips; Ctrl+R repeats the last one. "
+                 "Right-click for the full menu; the menu bar lists every command.",
             style="Muted.TLabel", wraplength=680, justify="left",
         ).pack(fill="x", padx=6, pady=(2, 6))
 
         self.override_tree = ttk.Treeview(
-            panel, columns=("track", "source", "mode", "start", "end", "source_start"),
+            panel, columns=("track", "source", "mode", "start", "end", "source_start", "fx"),
             show="headings", height=3,
         )
         for col, label, width in [
             ("track", "Track", 90), ("source", "Lane", 70), ("mode", "Mode", 70),
             ("start", "Timeline in", 85), ("end", "Timeline out", 85), ("source_start", "Source in", 85),
+            ("fx", "Effects", 180),
         ]:
             self.override_tree.heading(col, text=label)
             self.override_tree.column(col, width=width, anchor="center")
@@ -3166,6 +3226,20 @@ class MashupApp(tk.Tk):
                 f"on {tracks} track{'s' if tracks != 1 else ''}"
             )
 
+    def _effects_summary(self, clip):
+        """What the clip list shows in its Effects column."""
+        parts = []
+        if clip.get("mute"):
+            parts.append("Silenced")
+        speed = float(clip.get("speed", 1.0) or 1.0)
+        if abs(speed - 1.0) > 1e-6:
+            parts.append(f"{speed:g}x")
+        pitch = float(clip.get("pitch", 0.0) or 0.0)
+        if abs(pitch) > 1e-6:
+            parts.append(f"{pitch:+g} st")
+        parts.extend(effects.describe(effect) for effect in clip.get("effects") or [])
+        return ", ".join(parts)
+
     def _track_name_for(self, clip):
         for track in self.timeline_tracks:
             if track["id"] == clip.get("track"):
@@ -3183,6 +3257,7 @@ class MashupApp(tk.Tk):
                         self._track_name_for(clip), clip.get("source", "primary").capitalize(),
                         clip.get("mode", "replace").capitalize(),
                         clip["start_ms"], clip["end_ms"], clip.get("source_start_ms", clip["start_ms"]),
+                        self._effects_summary(clip),
                     ),
                 )
         finally:
@@ -3204,7 +3279,6 @@ class MashupApp(tk.Tk):
         shown here are the timeline's own key bindings, so they fire while the
         playlist has focus; the menu items themselves always work."""
         editor = self.playlist_editor
-        bar = self._menu()
 
         file_menu = self._menu()
         file_menu.add_command(label="Open primary track...", command=self._browse_primary)
@@ -3218,7 +3292,6 @@ class MashupApp(tk.Tk):
         file_menu.add_command(label="Open output folder", command=self._open_output_folder)
         file_menu.add_separator()
         file_menu.add_command(label="Exit", command=self.destroy)
-        bar.add_cascade(label="File", menu=file_menu)
 
         edit_menu = self._menu()
         edit_menu.add_command(label="Undo", accelerator="Ctrl+Z", command=editor.undo)
@@ -3258,7 +3331,6 @@ class MashupApp(tk.Tk):
         edit_menu.add_separator()
         edit_menu.add_command(label="Mute / unmute clips", accelerator="Ctrl+M",
                               command=editor.toggle_mute_selection)
-        bar.add_cascade(label="Edit", menu=edit_menu)
 
         select_menu = self._menu()
         select_menu.add_command(label="All", accelerator="Ctrl+A", command=editor.select_all)
@@ -3277,7 +3349,6 @@ class MashupApp(tk.Tk):
                                 command=lambda: editor.set_region(0))
         select_menu.add_command(label="Cursor to end", accelerator="End",
                                 command=lambda: editor.set_region(editor.total_ms))
-        bar.add_cascade(label="Select", menu=select_menu)
 
         tracks_menu = self._menu()
         add_menu = self._menu()
@@ -3307,7 +3378,6 @@ class MashupApp(tk.Tk):
         tracks_menu.add_separator()
         tracks_menu.add_command(label="Sort tracks by name", command=lambda: self._sort_tracks("name"))
         tracks_menu.add_command(label="Sort tracks by first clip", command=lambda: self._sort_tracks("time"))
-        bar.add_cascade(label="Tracks", menu=tracks_menu)
 
         view_menu = self._menu()
         view_menu.add_command(label="Zoom in", accelerator="Ctrl+Wheel", command=editor.zoom_in)
@@ -3317,14 +3387,14 @@ class MashupApp(tk.Tk):
                               command=editor.zoom_to_selection)
         view_menu.add_command(label="Fit in window", accelerator="Ctrl+F", command=editor.fit_view)
         view_menu.add_command(label="Zoom toggle", accelerator="Shift+Z", command=editor.zoom_toggle)
-        bar.add_cascade(label="View", menu=view_menu)
+        effect_menu = self._build_effect_menu()
 
         # Windows draws a toplevel's menu with the native, light-themed
         # menubar that Tk cannot restyle, so the strip lives inside the window
         # as themed menubuttons instead. The dropdowns are the same menus.
         self.menus = {
             "File": file_menu, "Edit": edit_menu, "Select": select_menu,
-            "Tracks": tracks_menu, "View": view_menu,
+            "Tracks": tracks_menu, "Effect": effect_menu, "View": view_menu,
         }
         strip = ttk.Frame(self, style="Menubar.TFrame")
         strip.pack(side="top", fill="x", before=self._scroll_outer)
@@ -3336,6 +3406,267 @@ class MashupApp(tk.Tk):
             side="top", fill="x", before=self._scroll_outer
         )
         self.menubar = strip
+
+    # Widgets whose own editing keys must win over the timeline shortcuts.
+    TEXT_WIDGET_CLASSES = frozenset({"TEntry", "Entry", "TSpinbox", "Spinbox", "TCombobox", "Text"})
+
+    def _bind_global_shortcuts(self):
+        """Route the timeline shortcuts from wherever focus happens to be.
+
+        Binding them on the canvas alone meant Ctrl+Z only worked while the
+        canvas itself had focus - not on a fresh window (focus starts on the
+        root) and not after clicking any button, spinbox or combobox, which is
+        most of the time. Text-entry widgets still keep their own keys.
+        """
+        shortcuts = {
+            "<Control-z>": lambda ed: ed.undo(),
+            "<Control-y>": lambda ed: ed.redo(),
+            "<Control-Shift-Z>": lambda ed: ed.redo(),
+            "<Control-a>": lambda ed: ed.select_all(),
+            "<Control-Shift-A>": lambda ed: ed.select_none(),
+            "<Control-c>": lambda ed: ed.copy_selection(),
+            "<Control-x>": lambda ed: ed.cut_selection(),
+            "<Control-v>": lambda ed: ed.paste_clipboard(),
+            "<Control-d>": lambda ed: ed.duplicate_to_new_track(),
+            "<Control-Shift-D>": lambda ed: ed.duplicate_selection(),
+            "<Control-i>": lambda ed: ed.split_at_selection(),
+            "<Control-Alt-i>": lambda ed: ed.split_to_new_track(),
+            "<Control-k>": lambda ed: ed.ripple_delete_selection(),
+            "<Control-Alt-k>": lambda ed: ed.split_delete_selection(),
+            "<Control-Alt-x>": lambda ed: ed.split_cut_selection(),
+            "<Control-t>": lambda ed: ed.trim_to_selection(),
+            "<Control-l>": lambda ed: ed.silence_selection(),
+            "<Control-j>": lambda ed: ed.join_selection(),
+            "<Control-m>": lambda ed: ed.toggle_mute_selection(),
+            "<Control-e>": lambda ed: ed.zoom_to_selection(),
+            "<Control-f>": lambda ed: ed.fit_view(),
+            "<Control-Key-2>": lambda ed: ed.zoom_normal(),
+            "<Control-r>": lambda ed: self._repeat_last_effect(),
+            "<Delete>": lambda ed: ed.delete_selected(),
+            "<bracketleft>": lambda ed: ed.cursor_to_boundary(-1),
+            "<bracketright>": lambda ed: ed.cursor_to_boundary(1),
+        }
+        for sequence, action in shortcuts.items():
+            self.bind_all(sequence, lambda event, fn=action: self._route_shortcut(fn, event))
+
+    def _route_shortcut(self, action, _event=None):
+        if self.mode_var.get() != MODE_STEMS:
+            return None
+        focused = self.focus_get()
+        if focused is not None and focused.winfo_class() in self.TEXT_WIDGET_CLASSES:
+            return None
+        action(self.playlist_editor)
+        return "break"
+
+    # ---- effects ----------------------------------------------------------
+
+    def _effect_targets(self):
+        """What an effect applies to, following Audacity: the selected region
+        on the selected tracks if there is one (split out first so the effect
+        lands only inside it), otherwise the selected clips."""
+        editor = self.playlist_editor
+        if editor.has_region():
+            start, end = editor.region()
+            editor._begin_transaction()
+            inside = editor._split_edges(
+                [clip for clip, _t in editor._clips_in_region()], start, end
+            )
+            if inside:
+                editor.selection = inside
+                return inside
+            editor._transaction_before = None
+        return list(editor.selection)
+
+    def _apply_effect(self, effect_type):
+        targets = self._effect_targets()
+        if not targets:
+            self.override_status_var.set(
+                "Select a region or some clips first, then pick an effect"
+            )
+            return
+        params = self._ask_effect_params(effect_type)
+        if params is None:
+            self.playlist_editor._cancel_interaction()
+            return
+        entry = {"type": effect_type, **params}
+        self.playlist_editor._begin_transaction()
+        for clip in targets:
+            clip.setdefault("effects", []).append(dict(entry))
+        self._last_effect = entry
+        self.playlist_editor._commit_transaction(
+            f"{effects.describe(entry)} on {len(targets)} clip(s)"
+        )
+
+    def _repeat_last_effect(self):
+        if not self._last_effect:
+            self.override_status_var.set("No effect to repeat yet")
+            return
+        targets = self._effect_targets()
+        if not targets:
+            self.override_status_var.set("Select a region or some clips first")
+            return
+        self.playlist_editor._begin_transaction()
+        for clip in targets:
+            clip.setdefault("effects", []).append(dict(self._last_effect))
+        self.playlist_editor._commit_transaction(
+            f"Repeated {effects.describe(self._last_effect)} on {len(targets)} clip(s)"
+        )
+
+    def _clear_effects(self):
+        targets = list(self.playlist_editor.selection)
+        if not targets:
+            self.override_status_var.set("Select clips to clear their effects")
+            return
+        self.playlist_editor._begin_transaction()
+        for clip in targets:
+            clip.pop("effects", None)
+            clip.pop("speed", None)
+            clip.pop("pitch", None)
+        self.playlist_editor._commit_transaction(f"Cleared effects on {len(targets)} clip(s)")
+
+    def _ask_effect_params(self, effect_type):
+        """Modal parameter form built from the effect's own spec. Returns the
+        chosen values, or None if the user cancelled."""
+        spec = effects.EFFECT_SPECS[effect_type]
+        if not spec["params"]:
+            return {}
+
+        dialog = tk.Toplevel(self)
+        dialog.title(spec["label"].rstrip("."))
+        dialog.configure(bg=BG)
+        dialog.transient(self)
+        dialog.resizable(False, False)
+
+        ttk.Label(dialog, text=spec["help"], style="Muted.TLabel", wraplength=340).pack(
+            fill="x", padx=14, pady=(14, 8)
+        )
+        body = ttk.Frame(dialog)
+        body.pack(fill="x", padx=14)
+        body.columnconfigure(1, weight=1)
+
+        variables = {}
+        for row, (key, label, low, high, step, default) in enumerate(spec["params"]):
+            ttk.Label(body, text=label).grid(row=row, column=0, sticky="w", pady=4, padx=(0, 10))
+            var = tk.DoubleVar(value=default)
+            ttk.Spinbox(
+                body, from_=low, to=high, increment=step, textvariable=var, width=10,
+            ).grid(row=row, column=1, sticky="e", pady=4)
+            variables[key] = (var, low, high, default)
+
+        result = {}
+
+        def confirm():
+            for key, (var, low, high, default) in variables.items():
+                try:
+                    value = float(var.get())
+                except (tk.TclError, ValueError):
+                    value = default
+                result[key] = max(low, min(high, value))
+            dialog.destroy()
+
+        buttons = ttk.Frame(dialog)
+        buttons.pack(fill="x", padx=14, pady=(12, 14))
+        ttk.Button(buttons, text="Cancel", command=dialog.destroy).pack(side="right")
+        ok = ttk.Button(buttons, text="Apply", style="Accent.TButton", command=confirm)
+        ok.pack(side="right", padx=6)
+        dialog.bind("<Return>", lambda _e: confirm())
+        dialog.bind("<Escape>", lambda _e: dialog.destroy())
+
+        dialog.update_idletasks()
+        x = self.winfo_rootx() + (self.winfo_width() - dialog.winfo_width()) // 2
+        y = self.winfo_rooty() + 140
+        dialog.geometry(f"+{max(0, x)}+{max(0, y)}")
+        ok.focus_set()
+        dialog.grab_set()
+        self.wait_window(dialog)
+        return result or None
+
+    def _ask_clip_speed_pitch(self):
+        """Audacity 3.7's per-clip pitch and speed, on the selected clips."""
+        targets = list(self.playlist_editor.selection)
+        if not targets:
+            self.override_status_var.set("Select clips to change their pitch or speed")
+            return
+        first = targets[0]
+
+        dialog = tk.Toplevel(self)
+        dialog.title("Clip pitch and speed")
+        dialog.configure(bg=BG)
+        dialog.transient(self)
+        dialog.resizable(False, False)
+        ttk.Label(
+            dialog,
+            text="Speed stretches the clip's source audio inside the slot it already occupies, "
+                 "so the timeline layout never shifts. Pitch is independent of it.",
+            style="Muted.TLabel", wraplength=360,
+        ).pack(fill="x", padx=14, pady=(14, 8))
+
+        body = ttk.Frame(dialog)
+        body.pack(fill="x", padx=14)
+        body.columnconfigure(1, weight=1)
+        speed_var = tk.DoubleVar(value=float(first.get("speed", 1.0) or 1.0))
+        pitch_var = tk.DoubleVar(value=float(first.get("pitch", 0.0) or 0.0))
+        follow_var = tk.BooleanVar(value=False)
+        ttk.Label(body, text="Speed (1.0 = unchanged)").grid(row=0, column=0, sticky="w", pady=4)
+        ttk.Spinbox(body, from_=0.25, to=4.0, increment=0.05, textvariable=speed_var,
+                    width=10).grid(row=0, column=1, sticky="e", pady=4)
+        ttk.Label(body, text="Pitch (semitones)").grid(row=1, column=0, sticky="w", pady=4)
+        ttk.Spinbox(body, from_=-24.0, to=24.0, increment=1.0, textvariable=pitch_var,
+                    width=10).grid(row=1, column=1, sticky="e", pady=4)
+        ttk.Checkbutton(
+            body, text="Let pitch follow speed (classic tape-style change speed)",
+            variable=follow_var,
+        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(8, 2))
+
+        def confirm():
+            try:
+                speed = max(0.25, min(4.0, float(speed_var.get())))
+                pitch = max(-24.0, min(24.0, float(pitch_var.get())))
+            except (tk.TclError, ValueError):
+                dialog.destroy()
+                return
+            if follow_var.get():
+                # Resampling by r shifts pitch by 12*log2(r) as well as timing.
+                pitch = 12.0 * math.log2(speed)
+            self.playlist_editor._begin_transaction()
+            for clip in targets:
+                clip["speed"] = speed
+                clip["pitch"] = pitch
+            self.playlist_editor._commit_transaction(
+                f"Speed {speed:g}x, pitch {pitch:+.1f} on {len(targets)} clip(s)"
+            )
+            dialog.destroy()
+
+        buttons = ttk.Frame(dialog)
+        buttons.pack(fill="x", padx=14, pady=(12, 14))
+        ttk.Button(buttons, text="Cancel", command=dialog.destroy).pack(side="right")
+        ttk.Button(buttons, text="Apply", style="Accent.TButton",
+                   command=confirm).pack(side="right", padx=6)
+        dialog.bind("<Return>", lambda _e: confirm())
+        dialog.bind("<Escape>", lambda _e: dialog.destroy())
+        dialog.update_idletasks()
+        dialog.geometry(
+            f"+{max(0, self.winfo_rootx() + (self.winfo_width() - dialog.winfo_width()) // 2)}"
+            f"+{max(0, self.winfo_rooty() + 140)}"
+        )
+        dialog.grab_set()
+        self.wait_window(dialog)
+
+    def _build_effect_menu(self):
+        menu = self._menu()
+        menu.add_command(label="Repeat last effect", accelerator="Ctrl+R",
+                         command=self._repeat_last_effect)
+        menu.add_separator()
+        for entry in effects.EFFECT_ORDER:
+            if entry is None:
+                menu.add_separator()
+                continue
+            spec = effects.EFFECT_SPECS[entry]
+            menu.add_command(label=spec["label"], command=lambda e=entry: self._apply_effect(e))
+        menu.add_separator()
+        menu.add_command(label="Clip pitch and speed...", command=self._ask_clip_speed_pitch)
+        menu.add_command(label="Remove all effects from clips", command=self._clear_effects)
+        return menu
 
     def _with_active_track(self, action):
         track = self.playlist_editor._active_track()
