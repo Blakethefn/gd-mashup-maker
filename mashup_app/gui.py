@@ -348,7 +348,8 @@ class PlaylistEditor(tk.Canvas):
     SHIFT_MASK = 0x0001
     CTRL_MASK = 0x0004
     TOOLS = ("select", "draw", "razor")
-    TOOL_CURSORS = {"select": "", "draw": "crosshair", "razor": "X_cursor"}
+    TOOL_CURSORS = {"select": "arrow", "draw": "crosshair", "razor": "X_cursor"}
+    TOOL_LABELS = {"select": "POINTER", "draw": "DRAW", "razor": "RAZOR"}
 
     def __init__(
         self, parent, get_clip_length_ms=None, get_clip_mode=None, get_snap_enabled=None,
@@ -401,6 +402,7 @@ class PlaylistEditor(tk.Canvas):
         self._drag_ref = None
         self._drag_ref_before = None
         self._drag_anchor_ms = 0.0
+        self._drag_click_ms = 0.0
         self._drag_grab_offset_ms = 0.0
         self._drag_slot_anchor = 0
         self._drag_additive = None
@@ -1391,6 +1393,12 @@ class PlaylistEditor(tk.Canvas):
             if self._track_index_of(clip) == index and self._clip_lane(clip, track) == lane
         ]
 
+    @staticmethod
+    def _lane_has_bed(track, lane):
+        """Whether the visible full-song audio bed occupies this lane."""
+        bed = track.get("bed", "muted")
+        return bed == lane or (bed == "both" and lane in STEM_LANES)
+
     def _hit_test(self, event):
         if event.x < self.HEADER_W:
             return None
@@ -1642,7 +1650,7 @@ class PlaylistEditor(tk.Canvas):
             10, self.RULER_H / 2, text="PLAYLIST", anchor="w", fill=TEXT, font=("Segoe UI", 8, "bold")
         )
         self.create_text(
-            self.HEADER_W - 8, self.RULER_H / 2, text=self.tool.upper(), anchor="e",
+            self.HEADER_W - 8, self.RULER_H / 2, text=self.TOOL_LABELS[self.tool], anchor="e",
             fill=ACCENT, font=("Segoe UI", 7, "bold"),
         )
         if self.has_region():
@@ -1810,7 +1818,14 @@ class PlaylistEditor(tk.Canvas):
             if self._in_selection(clip):
                 self.selection = [other for other in self.selection if other is not clip]
                 self._drag_mode = None
-                self._redraw()
+                if self.selection:
+                    self._select_clicked_clips(self._x_to_ms(event.x))
+                else:
+                    self.selected_track_ids = []
+                    self.whole_tracks_selected = False
+                    self.sel_end_ms = self.sel_start_ms
+                    self._set_status("Selection cleared")
+                    self._redraw()
                 return
             self.selection.append(clip)
         elif state & self.SHIFT_MASK:
@@ -1819,6 +1834,7 @@ class PlaylistEditor(tk.Canvas):
         elif not self._in_selection(clip):
             self.selection = [clip]
         self.whole_tracks_selected = False
+        self._drag_click_ms = self._x_to_ms(event.x)
 
         self._begin_transaction()
         duplicating = bool(state & self.ALT_MASK) and kind == "move"
@@ -1946,10 +1962,37 @@ class PlaylistEditor(tk.Canvas):
         self._drag_clips = []
         self._drag_ref = None
         self._drag_ref_before = None
-        self._commit_transaction({
+        changed = self._commit_transaction({
             "create": "Created clip", "move": "Moved clip",
             "resize-left": "Trimmed clip start", "resize-right": "Trimmed clip end",
         }.get(mode, "Edited clip"))
+        if not changed and mode in ("move", "resize-left", "resize-right"):
+            self._select_clicked_clips(self._drag_click_ms)
+
+    def _select_clicked_clips(self, cursor_ms=None):
+        """Turn a press/release on a clip into an ordinary pointer selection.
+
+        Clip dragging still starts immediately on motion, but a click now also
+        collapses any stale time range to a simple cursor. That makes subsequent
+        edit/effect commands act only on the visibly selected clips.
+        """
+        self._prune_selection()
+        if not self.selection:
+            return
+        start = min(int(clip["start_ms"]) for clip in self.selection)
+        end = max(int(clip["end_ms"]) for clip in self.selection)
+        track_ids = []
+        for clip in self.selection:
+            index = self._track_index_of(clip)
+            if index is not None and self.tracks[index]["id"] not in track_ids:
+                track_ids.append(self.tracks[index]["id"])
+        self.set_region(start if cursor_ms is None else cursor_ms, None, track_ids)
+        self.whole_tracks_selected = False
+        count = len(self.selection)
+        self._set_status(
+            f"Selected {count} clip{'s' if count != 1 else ''} "
+            f"({self._fmt_precise(start)} - {self._fmt_precise(end)})"
+        )
 
     def _finish_marquee(self):
         """A marquee does double duty, as in Audacity: it sets the time region
@@ -1964,15 +2007,22 @@ class PlaylistEditor(tk.Canvas):
             info = self._lane_info(y0)
             if info is None:
                 return
-            index, track, _lane = info
+            index, track, lane = info
             self.active_track_id = track["id"]
             self.selection = []
-            self.set_region(self._snap_point(self._x_to_ms(x0)), None, [track["id"]])
-            self.whole_tracks_selected = True
-            self._set_status(
-                f"'{track['name']}' selected at {self._fmt_precise(self.playhead_ms)} - "
-                f"drag to select part of it, or use its FX button for the whole track"
-            )
+            if self._lane_has_bed(track, lane):
+                # Beds are real, visible audio too. Treating them as empty
+                # canvas made the pointer appear broken unless the user knew
+                # to click the much smaller track header.
+                self.set_region(0, self.total_ms, [track["id"]])
+                self.whole_tracks_selected = True
+                self._set_status(f"Selected full track '{track['name']}'")
+            else:
+                self.set_region(self._snap_point(self._x_to_ms(x0)), None, [track["id"]])
+                self.whole_tracks_selected = False
+                self._set_status(
+                    f"Cursor {self._fmt_precise(self.playhead_ms)} on '{track['name']}'"
+                )
             return
         left, right = sorted((self._x_to_ms(x0), self._x_to_ms(x1)))
         top, bottom = sorted((y0, y1))
@@ -2186,13 +2236,16 @@ class PlaylistEditor(tk.Canvas):
             return
         if event.x < self.HEADER_W:
             self._feedback = None
-            self.configure(cursor="hand2" if event.y >= self.RULER_H else "")
+            self.configure(cursor="hand2" if event.y >= self.RULER_H else "arrow")
             self._redraw()
             return
         if event.y < self.RULER_H:
             ms = self._snap_point(self._x_to_ms(event.x), event)
             on_edge = self._region_edge_at(event.x)
-            self.configure(cursor="sb_h_double_arrow" if on_edge else "hand2")
+            cursor = "sb_h_double_arrow" if on_edge else (
+                "arrow" if self.tool == "select" else "hand2"
+            )
+            self.configure(cursor=cursor)
             self._set_feedback(
                 event.x, self.RULER_H + 24,
                 f"Drag the region {on_edge}" if on_edge
@@ -2206,7 +2259,7 @@ class PlaylistEditor(tk.Canvas):
             self.configure(cursor=self.TOOL_CURSORS[self.tool])
             self._redraw()
             return
-        index, _track, _lane = info
+        index, track, lane = info
         hit = self._hit_test(event)
         ms = self._snap_point(self._x_to_ms(event.x), event, hit[1] if hit else None)
         if self.tool == "razor":
@@ -2215,15 +2268,21 @@ class PlaylistEditor(tk.Canvas):
             self._set_feedback(event.x, event.y, text, ms, index)
         elif hit is None:
             self.configure(cursor=self.TOOL_CURSORS[self.tool])
-            text = (
-                f"Draw from {self._fmt_precise(ms)}" if self.tool == "draw"
-                else f"{self._fmt_precise(ms)}  (drag to marquee-select)"
-            )
+            if self.tool == "draw":
+                text = f"Draw from {self._fmt_precise(ms)}"
+            elif self._lane_has_bed(track, lane):
+                text = f"Click to select '{track['name']}' - drag to select a region"
+            else:
+                text = f"Cursor {self._fmt_precise(ms)} - drag to select a region"
             self._set_feedback(event.x, event.y, text, ms, index)
         else:
             kind, clip = hit
-            self.configure(cursor="fleur" if kind == "move" else "sb_h_double_arrow")
-            self._set_feedback(event.x, event.y, self._clip_summary(clip), ms, index)
+            cursor = "arrow" if self.tool == "select" and kind == "move" else (
+                "fleur" if kind == "move" else "sb_h_double_arrow"
+            )
+            self.configure(cursor=cursor)
+            prefix = "Click to select - drag to move\n" if self.tool == "select" and kind == "move" else ""
+            self._set_feedback(event.x, event.y, prefix + self._clip_summary(clip), ms, index)
         self._redraw()
 
     def _on_leave(self, _event):
@@ -2240,6 +2299,7 @@ class PlaylistEditor(tk.Canvas):
         self._drag_clips = []
         self._drag_ref = None
         self._drag_ref_before = None
+        self._drag_click_ms = 0.0
         self._external_drag = None
         self._marquee = None
         self._feedback = None
@@ -2372,7 +2432,7 @@ class MashupApp(tk.Tk):
         self.override_snap_var = tk.StringVar(value="Nearest")
         self.region_var = tk.StringVar(value="0:00.000 - 0:00.000  (cursor)")
         self.override_status_var = tk.StringVar(
-            value="Draw (B) clips in a lane, drag them with Select (V), cut with Razor (R)."
+            value="Pointer (V): click audio to select it, or drag to select a time region."
         )
 
         self.primary_duration_ms = 0
@@ -3121,7 +3181,7 @@ class MashupApp(tk.Tk):
         tool_row = ttk.Frame(panel)
         tool_row.pack(fill="x", padx=6, pady=(6, 2))
         ttk.Label(tool_row, text="Tool:").pack(side="left")
-        for label, value in (("Select (V)", "select"), ("Draw (B)", "draw"), ("Razor (R)", "razor")):
+        for label, value in (("Pointer (V)", "select"), ("Draw (B)", "draw"), ("Razor (R)", "razor")):
             ttk.Radiobutton(
                 tool_row, text=label, value=value, variable=self.override_tool_var,
                 style="Toolbutton", command=lambda v=value: self.playlist_editor.set_tool(v),
@@ -3237,7 +3297,8 @@ class MashupApp(tk.Tk):
             text="Every track plays whatever its lanes feed it: stem tracks have Primary (P) and Secondary (S) "
                  "sublanes, imported tracks a single Audio (A) lane, so dragging a clip onto another track "
                  "re-sources it. Overlapping Layer clips really play together; Replace clips take over from the "
-                 "full-song bed. Select (V) drags clips and marquee-drags a region, Draw (B) paints new clips, "
+                 "full-song bed. Pointer (V) clicks clips or beds to select them and drags clips to move them; "
+                 "dragging empty space selects a time region. Draw (B) paints new clips, "
                  "Razor (R) splits. Drag the ruler to select a time region, then use the region buttons above "
                  "or Ctrl+I split / Ctrl+T trim / Ctrl+L silence / Ctrl+K delete-and-close / Ctrl+Alt+K "
                  "delete-and-gap / Ctrl+J join. Ctrl+D duplicates to a new track, Ctrl+Shift+D in place, "
