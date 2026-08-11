@@ -1,4 +1,6 @@
-"""Tkinter GUI: pick two MP3s, choose a mashup mode, tweak its controls, render."""
+"""Tkinter GUI for a prepared-source, real-time mashup audio graph."""
+import copy
+import hashlib
 import itertools
 import json
 import math
@@ -9,7 +11,8 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
-from . import effects, mixer
+from . import effects, preprocessing
+from .audio_graph import AudioGraphFactory, RealtimeMixer, SmartRenderer
 
 MODE_SIMPLE = "Simple Overlay/Crossfade"
 MODE_BEAT_SYNCED = "Beat-Synced Blend"
@@ -185,6 +188,7 @@ class LabeledScale(ttk.Frame):
         self.fmt = fmt
         self.unit = unit
         self._change_callback = None
+        self._change_callbacks = []
 
         ttk.Label(self, text=label, width=32, anchor="w").grid(row=0, column=0, sticky="w")
         self.value_label = ttk.Label(self, text=self._format(default), width=9, anchor="e", style="Muted.TLabel")
@@ -202,6 +206,8 @@ class LabeledScale(ttk.Frame):
         self.value_label.config(text=self._format(self.var.get()))
         if self._change_callback:
             self._change_callback(self.var.get())
+        for callback in tuple(self._change_callbacks):
+            callback(self.var.get())
 
     def get(self):
         return self.var.get()
@@ -215,6 +221,10 @@ class LabeledScale(ttk.Frame):
         changes (by dragging the slider OR via set()), so an external widget
         like a timeline can stay in sync."""
         self._change_callback = callback
+
+    def add_change_callback(self, callback):
+        """Add a listener without replacing a widget's existing synchronizer."""
+        self._change_callbacks.append(callback)
 
 
 class OffsetTimeline(tk.Canvas):
@@ -2580,6 +2590,19 @@ class MashupApp(tk.Tk):
         self.render_queue: queue.Queue = queue.Queue()
         self.last_output_path = None
         self.render_thread = None
+        self.preprocess_thread = None
+        self.graph_thread = None
+        self._pending_graph_build = None
+        self.current_graph = None
+        self._current_graph_request = None
+        self._graph_generation = 0
+        self._live_refresh_job = None
+        self.graph_factory = AudioGraphFactory()
+        self.smart_renderer = SmartRenderer()
+        self.realtime_mixer = RealtimeMixer(
+            on_position=lambda position: self.render_queue.put(("transport", position)),
+            on_stopped=lambda: self.render_queue.put(("transport_stopped", None)),
+        )
 
         self._apply_theme()
         self._build_scroll_container()
@@ -2593,9 +2616,11 @@ class MashupApp(tk.Tk):
         self._build_action_buttons()
 
         self._bind_global_shortcuts()
+        self._bind_realtime_controls()
         self._show_mode_frame()
         self._center_window(1000, 820)
         self.after(100, self._poll_queue)
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     # ---- theme & layout scaffolding ----------------------------------
 
@@ -2741,7 +2766,7 @@ class MashupApp(tk.Tk):
         frame.pack(fill="x", padx=18, pady=(16, 6))
         ttk.Label(frame, text="MP3 Mashup Tool", style="Title.TLabel").pack(anchor="w")
         ttk.Label(
-            frame, text="Blend two tracks into one - pick a mode, tweak the mix, render.",
+            frame, text="Prepare once, mix through a live audio graph, then export the same snapshot.",
             style="Subtitle.TLabel",
         ).pack(anchor="w", pady=(2, 0))
 
@@ -2969,8 +2994,8 @@ class MashupApp(tk.Tk):
 
         note = ttk.Label(
             frame,
-            text="First run downloads the Demucs model and separation takes ~1-3 min per track on CPU.\n"
-                 "Results are cached, so re-rendering the same file is instant after the first time.",
+            text="Pre-process Audio runs Demucs before playback/export (about 1-3 min per track on CPU).\n"
+                 "Prepared stems are cached; Smart Render never runs separation.",
             style="Muted.TLabel", wraplength=680, justify="left",
         )
         note.pack(fill="x", pady=(8, 8), padx=8)
@@ -3276,6 +3301,7 @@ class MashupApp(tk.Tk):
         track["bed"] = var.get().lower()
         self.playlist_editor._redraw()
         self._update_timelines()
+        self._mark_graph_dirty()
 
     def _write_track_number(self, track, key, var):
         try:
@@ -3283,10 +3309,12 @@ class MashupApp(tk.Tk):
         except (tk.TclError, ValueError):
             return
         self.playlist_editor._redraw()
+        self._mark_graph_dirty()
 
     def _write_track_flag(self, track, key, var):
         track[key] = bool(var.get())
         self.playlist_editor._redraw()
+        self._mark_graph_dirty()
 
     # ---- playlist panel --------------------------------------------------
 
@@ -3457,6 +3485,7 @@ class MashupApp(tk.Tk):
         self.playlist_editor.set_clips(self.stem_overrides)
         self.override_undo_button.configure(state="normal" if self.playlist_editor.can_undo else "disabled")
         self.override_redo_button.configure(state="normal" if self.playlist_editor.can_redo else "disabled")
+        self._mark_graph_dirty()
 
     # ---- menu bar ---------------------------------------------------------
 
@@ -3480,7 +3509,8 @@ class MashupApp(tk.Tk):
         file_menu.add_command(label="Swap primary / secondary", command=self._swap_tracks)
         file_menu.add_command(label="Choose output file...", command=self._browse_output)
         file_menu.add_separator()
-        file_menu.add_command(label="Render mashup", command=self._render)
+        file_menu.add_command(label="Pre-process audio", command=self._preprocess_audio)
+        file_menu.add_command(label="Smart render mashup", command=self._render)
         file_menu.add_command(label="Open output folder", command=self._open_output_folder)
         file_menu.add_separator()
         file_menu.add_command(label="Exit", command=self.destroy)
@@ -4404,12 +4434,48 @@ class MashupApp(tk.Tk):
     def _build_action_buttons(self):
         frame = ttk.Frame(self.content)
         frame.pack(fill="x", padx=18, pady=(4, 18))
-        self.render_button = ttk.Button(frame, text="▶  Render Mashup", style="Accent.TButton", command=self._render)
+        self.preprocess_button = ttk.Button(
+            frame, text="1. Pre-process Audio", style="Accent.TButton", command=self._preprocess_audio
+        )
+        self.preprocess_button.pack(side="left")
+        self.play_button = ttk.Button(frame, text="2. Play Live", command=self._toggle_live_play)
+        self.play_button.pack(side="left", padx=(8, 3))
+        self.stop_button = ttk.Button(frame, text="Stop", command=self._stop_live, state="disabled")
+        self.stop_button.pack(side="left", padx=(0, 8))
+        self.render_button = ttk.Button(frame, text="3. Smart Render", command=self._render)
         self.render_button.pack(side="left")
-        self.play_button = ttk.Button(frame, text="\U0001F50A  Play Result", command=self._play_result, state="disabled")
-        self.play_button.pack(side="left", padx=8)
+        self.result_button = ttk.Button(frame, text="Open Export", command=self._play_result, state="disabled")
+        self.result_button.pack(side="left", padx=8)
         self.open_folder_button = ttk.Button(frame, text="\U0001F4C2  Open Output Folder", command=self._open_output_folder)
         self.open_folder_button.pack(side="left")
+
+    def _bind_realtime_controls(self):
+        """Mark graph snapshots stale when a non-destructive control changes."""
+        scale_names = (
+            "simple_offset", "simple_primary_gain", "simple_secondary_gain", "simple_crossfade",
+            "simple_duck_amount", "simple_reverb_amount", "simple_reverb_size",
+            "simple_primary_reverb_amount", "beat_start", "beat_duration", "beat_primary_gain",
+            "beat_secondary_gain", "beat_duck_amount", "beat_reverb_amount", "beat_reverb_size",
+            "beat_primary_reverb_amount", "vocals_offset", "vocals_gain", "instrumental_gain",
+            "vocals_duck_amount", "vocals_reverb_amount", "vocals_reverb_size",
+            "vocals_instrumental_reverb_amount", "stems_offset", "stems_primary_gain",
+            "stems_secondary_gain", "stems_duck_amount", "stems_reverb_amount",
+            "stems_reverb_size", "stems_primary_reverb_amount", "stems_override_crossfade",
+        )
+        for name in scale_names:
+            scale = getattr(self, name, None)
+            if scale is not None:
+                scale.add_change_callback(lambda _value: self._mark_graph_dirty())
+        variable_names = (
+            "simple_match_loudness_var", "simple_low_cut_var", "beat_match_loudness_var",
+            "beat_low_cut_var", "vocals_match_loudness_var", "vocals_carve_var",
+            "stems_match_loudness_var", "stems_tempo_match_var", "stems_auto_fallback_var",
+            "tempo_match_var", "key_match_var", "vocals_from_var",
+        )
+        for name in variable_names:
+            variable = getattr(self, name, None)
+            if variable is not None:
+                variable.trace_add("write", lambda *_args: self._mark_graph_dirty())
 
     def _show_mode_frame(self):
         for frame in self.mode_frames.values():
@@ -4421,6 +4487,7 @@ class MashupApp(tk.Tk):
         self.mode_frames[mode].pack(fill="x")
         if mode != MODE_STEMS:
             self._sync_shared_timeline(mode)
+        self._mark_graph_dirty()
 
     def _sync_shared_timeline(self, mode):
         scale = self._offset_scales[mode]
@@ -4491,6 +4558,7 @@ class MashupApp(tk.Tk):
 
         if path and duration_ms:
             self._queue_waveform(path)
+        self._mark_graph_dirty()
         self._update_timelines()
         self._maybe_autofill_output()
 
@@ -4586,17 +4654,103 @@ class MashupApp(tk.Tk):
 
     # ---- validation ----------------------------------------------------
 
-    def _validate_inputs(self) -> bool:
+    def _validate_sources(self) -> bool:
         if not self.primary_path.get() or not Path(self.primary_path.get()).exists():
             messagebox.showerror("Missing file", "Choose a valid primary MP3 file.")
             return False
         if not self.secondary_path.get() or not Path(self.secondary_path.get()).exists():
             messagebox.showerror("Missing file", "Choose a valid secondary MP3 file.")
             return False
+        return True
+
+    def _validate_inputs(self) -> bool:
+        if not self._validate_sources():
+            return False
         if not self.output_path.get():
             messagebox.showerror("Missing output", "Choose an output path.")
             return False
         return True
+
+    def _architecture_mode(self) -> str:
+        return {
+            MODE_SIMPLE: preprocessing.MODE_SIMPLE,
+            MODE_BEAT_SYNCED: preprocessing.MODE_BEAT,
+            MODE_VOCALS: preprocessing.MODE_VOCALS,
+            MODE_STEMS: preprocessing.MODE_STEMS,
+        }[self.mode_var.get()]
+
+    def _graph_settings_snapshot(self) -> dict:
+        """Copy Tk/editor state once; worker threads never touch Tk variables."""
+        mode = self.mode_var.get()
+        if mode == MODE_SIMPLE:
+            return {
+                "offset_ms": int(self.simple_offset.get()),
+                "primary_gain_db": self.simple_primary_gain.get(),
+                "secondary_gain_db": self.simple_secondary_gain.get(),
+                "crossfade_ms": int(self.simple_crossfade.get()),
+                "match_loudness": self.simple_match_loudness_var.get(),
+                "low_cut_secondary": self.simple_low_cut_var.get(),
+                "duck_amount": self.simple_duck_amount.get() / 100.0,
+                "reverb_amount": self.simple_reverb_amount.get() / 100.0,
+                "reverb_size": self.simple_reverb_size.get() / 100.0,
+                "primary_reverb_amount": self.simple_primary_reverb_amount.get() / 100.0,
+            }
+        if mode == MODE_BEAT_SYNCED:
+            return {
+                "blend_start_ms": int(self.beat_start.get()),
+                "blend_duration_ms": int(self.beat_duration.get()),
+                "primary_gain_db": self.beat_primary_gain.get(),
+                "secondary_gain_db": self.beat_secondary_gain.get(),
+                "match_loudness": self.beat_match_loudness_var.get(),
+                "low_cut_secondary": self.beat_low_cut_var.get(),
+                "duck_amount": self.beat_duck_amount.get() / 100.0,
+                "reverb_amount": self.beat_reverb_amount.get() / 100.0,
+                "reverb_size": self.beat_reverb_size.get() / 100.0,
+                "primary_reverb_amount": self.beat_primary_reverb_amount.get() / 100.0,
+            }
+        if mode == MODE_VOCALS:
+            return {
+                "vocals_from": self.vocals_from_var.get().lower(),
+                "tempo_match": self.tempo_match_var.get(),
+                "key_match": self.key_match_var.get(),
+                "offset_ms": int(self.vocals_offset.get()),
+                "vocal_gain_db": self.vocals_gain.get(),
+                "instrumental_gain_db": self.instrumental_gain.get(),
+                "match_loudness": self.vocals_match_loudness_var.get(),
+                "carve_for_vocal": self.vocals_carve_var.get(),
+                "duck_amount": self.vocals_duck_amount.get() / 100.0,
+                "reverb_amount": self.vocals_reverb_amount.get() / 100.0,
+                "reverb_size": self.vocals_reverb_size.get() / 100.0,
+                "instrumental_reverb_amount": self.vocals_instrumental_reverb_amount.get() / 100.0,
+            }
+        return {
+            "stem_sources": self._stem_source_map(),
+            "stem_overrides": copy.deepcopy(self.stem_overrides),
+            "timeline_tracks": copy.deepcopy(self.timeline_tracks),
+            "offset_ms": int(self.stems_offset.get()),
+            "primary_gain_db": self.stems_primary_gain.get(),
+            "secondary_gain_db": self.stems_secondary_gain.get(),
+            "tempo_match": self.stems_tempo_match_var.get(),
+            "match_loudness": self.stems_match_loudness_var.get(),
+            "duck_amount": self.stems_duck_amount.get() / 100.0,
+            "reverb_amount": self.stems_reverb_amount.get() / 100.0,
+            "reverb_size": self.stems_reverb_size.get() / 100.0,
+            "primary_reverb_amount": self.stems_primary_reverb_amount.get() / 100.0,
+            "auto_fallback": self.stems_auto_fallback_var.get(),
+            "override_crossfade_ms": int(self.stems_override_crossfade.get()),
+        }
+
+    def _graph_request(self) -> dict:
+        request = {
+            "mode": self._architecture_mode(),
+            "primary_path": self.primary_path.get(),
+            "secondary_path": self.secondary_path.get(),
+            "settings": self._graph_settings_snapshot(),
+        }
+        request["key"] = hashlib.sha256(
+            json.dumps(request, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        return request
 
     # ---- analyze (mode 2 helper) ----------------------------------------
 
@@ -4616,22 +4770,7 @@ class MashupApp(tk.Tk):
         except Exception as exc:  # noqa: BLE001 - surface any analysis failure to the user
             self.render_queue.put(("error", str(exc)))
 
-    # ---- render ----------------------------------------------------
-
-    def _render(self):
-        if not self._validate_inputs():
-            return
-        if self.render_thread and self.render_thread.is_alive():
-            return
-
-        self.render_button.config(state="disabled")
-        self.play_button.config(state="disabled")
-        self.progress.start(10)
-        self.status_label.configure(style="Working.TLabel")
-        self.status_var.set("Starting render...")
-
-        self.render_thread = threading.Thread(target=self._render_worker, daemon=True)
-        self.render_thread.start()
+    # ---- pre-process / live graph / smart render ------------------------
 
     def _queue_status(self, message: str):
         self.render_queue.put(("status", message))
@@ -4646,95 +4785,153 @@ class MashupApp(tk.Tk):
             mapping.setdefault(track["stem"], track["bed"])
         return {name: mapping.get(name, "muted") for name in STEM_NAMES}
 
-    def _render_worker(self):
-        from . import audio_io
+    def _mark_graph_dirty(self):
+        if not hasattr(self, "realtime_mixer"):
+            return
+        self._current_graph_request = None
+        if self.realtime_mixer.is_playing:
+            if self._live_refresh_job is not None:
+                self.after_cancel(self._live_refresh_job)
+            self._live_refresh_job = self.after(180, self._refresh_live_graph)
 
-        mode = self.mode_var.get()
+    def _refresh_live_graph(self):
+        self._live_refresh_job = None
+        if not self.realtime_mixer.is_playing or not self._validate_sources():
+            return
+        self._start_graph_build(self._graph_request(), autoplay=False, quiet=True)
+
+    def _set_working(self, message: str):
+        self.progress.start(10)
+        self.status_label.configure(style="Working.TLabel")
+        self.status_var.set(message)
+
+    def _preprocess_audio(self):
+        if not self._validate_sources():
+            return
+        if self.preprocess_thread and self.preprocess_thread.is_alive():
+            return
+        request = self._graph_request()
+        self.preprocess_button.config(state="disabled")
+        self.render_button.config(state="disabled")
+        self._set_working("Pre-processing immutable source assets...")
+        self.preprocess_thread = threading.Thread(
+            target=self._preprocess_worker, args=(request,), daemon=True
+        )
+        self.preprocess_thread.start()
+
+    def _preprocess_worker(self, request: dict):
         try:
-            if mode == MODE_SIMPLE:
-                segment = mixer.simple_overlay(
-                    self.primary_path.get(),
-                    self.secondary_path.get(),
-                    offset_ms=int(self.simple_offset.get()),
-                    primary_gain_db=self.simple_primary_gain.get(),
-                    secondary_gain_db=self.simple_secondary_gain.get(),
-                    crossfade_ms=int(self.simple_crossfade.get()),
-                    match_loudness=self.simple_match_loudness_var.get(),
-                    low_cut_secondary=self.simple_low_cut_var.get(),
-                    duck_amount=self.simple_duck_amount.get() / 100.0,
-                    reverb_amount=self.simple_reverb_amount.get() / 100.0,
-                    reverb_size=self.simple_reverb_size.get() / 100.0,
-                    primary_reverb_amount=self.simple_primary_reverb_amount.get() / 100.0,
-                    progress_callback=self._queue_status,
-                )
-            elif mode == MODE_BEAT_SYNCED:
-                segment = mixer.beat_synced_blend(
-                    self.primary_path.get(),
-                    self.secondary_path.get(),
-                    blend_start_ms=int(self.beat_start.get()),
-                    blend_duration_ms=int(self.beat_duration.get()),
-                    primary_gain_db=self.beat_primary_gain.get(),
-                    secondary_gain_db=self.beat_secondary_gain.get(),
-                    match_loudness=self.beat_match_loudness_var.get(),
-                    low_cut_secondary=self.beat_low_cut_var.get(),
-                    duck_amount=self.beat_duck_amount.get() / 100.0,
-                    reverb_amount=self.beat_reverb_amount.get() / 100.0,
-                    reverb_size=self.beat_reverb_size.get() / 100.0,
-                    primary_reverb_amount=self.beat_primary_reverb_amount.get() / 100.0,
-                    progress_callback=self._queue_status,
-                )
-            elif mode == MODE_VOCALS:
-                if self.vocals_from_var.get() == "Primary":
-                    vocal_source, instrumental_source = self.primary_path.get(), self.secondary_path.get()
-                else:
-                    vocal_source, instrumental_source = self.secondary_path.get(), self.primary_path.get()
-                segment = mixer.vocals_over_instrumental(
-                    vocal_source,
-                    instrumental_source,
-                    tempo_match=self.tempo_match_var.get(),
-                    key_match=self.key_match_var.get(),
-                    offset_ms=int(self.vocals_offset.get()),
-                    vocal_gain_db=self.vocals_gain.get(),
-                    instrumental_gain_db=self.instrumental_gain.get(),
-                    match_loudness=self.vocals_match_loudness_var.get(),
-                    carve_for_vocal=self.vocals_carve_var.get(),
-                    duck_amount=self.vocals_duck_amount.get() / 100.0,
-                    reverb_amount=self.vocals_reverb_amount.get() / 100.0,
-                    reverb_size=self.vocals_reverb_size.get() / 100.0,
-                    instrumental_reverb_amount=self.vocals_instrumental_reverb_amount.get() / 100.0,
-                    progress_callback=self._queue_status,
-                )
-            else:  # MODE_STEMS
-                segment = mixer.stem_mix(
-                    self.primary_path.get(),
-                    self.secondary_path.get(),
-                    stem_sources=self._stem_source_map(),
-                    stem_overrides=[dict(clip) for clip in self.stem_overrides],
-                    timeline_tracks=[dict(track) for track in self.timeline_tracks],
-                    offset_ms=int(self.stems_offset.get()),
-                    primary_gain_db=self.stems_primary_gain.get(),
-                    secondary_gain_db=self.stems_secondary_gain.get(),
-                    tempo_match=self.stems_tempo_match_var.get(),
-                    match_loudness=self.stems_match_loudness_var.get(),
-                    duck_amount=self.stems_duck_amount.get() / 100.0,
-                    reverb_amount=self.stems_reverb_amount.get() / 100.0,
-                    reverb_size=self.stems_reverb_size.get() / 100.0,
-                    primary_reverb_amount=self.stems_primary_reverb_amount.get() / 100.0,
-                    auto_fallback=self.stems_auto_fallback_var.get(),
-                    override_crossfade_ms=int(self.stems_override_crossfade.get()),
-                    progress_callback=self._queue_status,
-                )
+            project = preprocessing.prepare_project(
+                request["primary_path"], request["secondary_path"], request["mode"], self._queue_status
+            )
+            self._queue_status("Compiling the real-time graph and warming derived-asset caches...")
+            graph = self.graph_factory.build(project, request["settings"])
+            self.render_queue.put(("prepared", (graph, request["key"])))
+        except Exception as exc:  # noqa: BLE001 - surface preparation failures
+            self.render_queue.put(("error", str(exc)))
 
-            self._queue_status("Exporting mp3...")
-            output_path = self.output_path.get()
-            audio_io.export_mp3(segment, output_path)
-            self.render_queue.put(("done", output_path))
+    def _start_graph_build(self, request: dict, autoplay: bool, quiet: bool = False):
+        if self.graph_thread and self.graph_thread.is_alive():
+            self._pending_graph_build = (request, autoplay, quiet)
+            return
+        self._graph_generation += 1
+        generation = self._graph_generation
+        if not quiet:
+            self._set_working("Loading prepared assets into the real-time graph...")
+        self.graph_thread = threading.Thread(
+            target=self._graph_worker, args=(request, generation, autoplay, quiet), daemon=True
+        )
+        self.graph_thread.start()
+
+    def _graph_worker(self, request: dict, generation: int, autoplay: bool, quiet: bool):
+        try:
+            project = preprocessing.load_prepared_project(
+                request["primary_path"], request["secondary_path"], request["mode"]
+            )
+            graph = self.graph_factory.build(project, request["settings"])
+            self.render_queue.put(("graph_ready", (generation, graph, request["key"], autoplay)))
+        except preprocessing.PreparationRequiredError as exc:
+            if not quiet:
+                self.render_queue.put(("preparation_required", str(exc)))
+        except Exception as exc:  # noqa: BLE001 - surface graph failures
+            if not quiet:
+                self.render_queue.put(("error", str(exc)))
+        finally:
+            self.graph_thread = None
+            self.render_queue.put(("graph_build_finished", generation))
+
+    def _toggle_live_play(self):
+        if self.realtime_mixer.is_playing:
+            self.realtime_mixer.pause()
+            self.play_button.config(text="2. Play Live")
+            self.status_var.set(f"Paused at {self.realtime_mixer.position_ms / 1000:.2f}s")
+            return
+        if not self._validate_sources():
+            return
+        request = self._graph_request()
+        if self.current_graph is not None and self._current_graph_request == request["key"]:
+            self._start_transport(self.current_graph)
+        else:
+            self._start_graph_build(request, autoplay=True)
+
+    def _start_transport(self, graph):
+        try:
+            self.realtime_mixer.set_graph(graph, preserve_position=True)
+            if self.realtime_mixer.position_ms >= graph.duration_ms:
+                self.realtime_mixer.seek(0)
+            if self.mode_var.get() == MODE_STEMS and self.realtime_mixer.position_ms == 0:
+                self.realtime_mixer.seek(self.playlist_editor.playhead_ms)
+            self.realtime_mixer.play()
+            self.play_button.config(text="Pause Live")
+            self.stop_button.config(state="normal")
+            self.progress.stop()
+            self.status_label.configure(style="Success.TLabel")
+            self.status_var.set("Playing the live audio graph.")
+        except Exception as exc:  # noqa: BLE001 - device/backend errors belong in the UI
+            self.render_queue.put(("error", f"Could not start real-time audio: {exc}"))
+
+    def _stop_live(self):
+        self.realtime_mixer.stop()
+        self.play_button.config(text="2. Play Live")
+        self.stop_button.config(state="disabled")
+        self.status_var.set("Live transport stopped.")
+
+    def _render(self):
+        if not self._validate_inputs():
+            return
+        if self.render_thread and self.render_thread.is_alive():
+            return
+        request = self._graph_request()
+        output_path = self.output_path.get()
+        self.render_button.config(state="disabled")
+        self._set_working("Building a smart-render graph snapshot...")
+        self.render_thread = threading.Thread(
+            target=self._render_worker, args=(request, output_path), daemon=True
+        )
+        self.render_thread.start()
+
+    def _render_worker(self, request: dict, output_path: str):
+        try:
+            # Cache-only: export has no code path that can invoke Demucs.
+            project = preprocessing.load_prepared_project(
+                request["primary_path"], request["secondary_path"], request["mode"]
+            )
+            graph = self.graph_factory.build(project, request["settings"])
+            report = self.smart_renderer.render(graph, output_path, self._queue_status)
+            self.render_queue.put(("done", report))
+        except preprocessing.PreparationRequiredError as exc:
+            self.render_queue.put(("preparation_required", str(exc)))
         except Exception as exc:  # noqa: BLE001 - surface any render failure to the user
             self.render_queue.put(("error", str(exc)))
 
     def _play_result(self):
         if self.last_output_path and Path(self.last_output_path).exists():
             os.startfile(self.last_output_path)  # noqa: S606 - user-initiated, local file only
+
+    def _on_close(self):
+        self.realtime_mixer.close()
+        self.graph_factory.close()
+        self.destroy()
 
     # ---- queue polling ----------------------------------------------------
 
@@ -4757,19 +4954,79 @@ class MashupApp(tk.Tk):
                     self.playlist_editor._redraw()
                 elif kind == "waveform_error":
                     self._waveform_jobs.discard(payload)
+                elif kind == "prepared":
+                    graph, request_key = payload
+                    current_key = self._graph_request()["key"]
+                    if request_key == current_key:
+                        self.current_graph = graph
+                        self._current_graph_request = request_key
+                        self.realtime_mixer.set_graph(graph, preserve_position=False)
+                    else:
+                        self._current_graph_request = None
+                    self.progress.stop()
+                    self.preprocess_button.config(state="normal")
+                    self.render_button.config(state="normal")
+                    self.status_label.configure(style="Success.TLabel")
+                    self.status_var.set(
+                        "Prepared. The same real-time graph is ready for live playback and smart render."
+                        if request_key == current_key
+                        else "Source assets are prepared. Mix settings changed; the graph will rebuild on Play."
+                    )
+                elif kind == "graph_ready":
+                    generation, graph, request_key, autoplay = payload
+                    if generation != self._graph_generation:
+                        continue
+                    was_playing = self.realtime_mixer.is_playing
+                    self.current_graph = graph
+                    self._current_graph_request = request_key
+                    self.realtime_mixer.set_graph(graph, preserve_position=True)
+                    self.progress.stop()
+                    if autoplay:
+                        self._start_transport(graph)
+                    elif was_playing:
+                        self.status_var.set("Live graph updated without stopping playback.")
+                elif kind == "graph_build_finished":
+                    if self._pending_graph_build is not None:
+                        request, autoplay, quiet = self._pending_graph_build
+                        self._pending_graph_build = None
+                        self._start_graph_build(request, autoplay, quiet)
+                elif kind == "transport":
+                    if self.mode_var.get() == MODE_STEMS:
+                        self.playlist_editor.playhead_ms = max(
+                            0.0, min(float(self.playlist_editor.total_ms), float(payload))
+                        )
+                        self.playlist_editor._redraw()
+                elif kind == "transport_stopped":
+                    self.play_button.config(text="2. Play Live")
+                    self.stop_button.config(state="disabled")
                 elif kind == "done":
                     self.progress.stop()
                     self.render_button.config(state="normal")
-                    self.play_button.config(state="normal")
-                    self.last_output_path = payload
+                    self.preprocess_button.config(state="normal")
+                    self.result_button.config(state="normal")
+                    self.last_output_path = payload.output_path
                     self.status_label.configure(style="Success.TLabel")
-                    self.status_var.set(f"Done. Saved to {payload}")
-                elif kind == "error":
+                    if payload.reused:
+                        self.status_var.set(f"Smart render reused the unchanged export: {payload.output_path}")
+                    else:
+                        self.status_var.set(
+                            f"Smart render complete ({payload.rendered_blocks} blocks): {payload.output_path}"
+                        )
+                elif kind == "preparation_required":
                     self.progress.stop()
+                    self.preprocess_button.config(state="normal")
                     self.render_button.config(state="normal")
                     self.status_label.configure(style="Error.TLabel")
-                    self.status_var.set("Failed - see error dialog.")
-                    messagebox.showerror("Render failed", payload)
+                    self.status_var.set("Pre-processing is required before playback or render.")
+                    messagebox.showinfo("Pre-process Audio", payload)
+                elif kind == "error":
+                    self.progress.stop()
+                    self.preprocess_button.config(state="normal")
+                    self.render_button.config(state="normal")
+                    self.play_button.config(text="2. Play Live")
+                    self.status_label.configure(style="Error.TLabel")
+                    self.status_var.set("Audio operation failed - see error dialog.")
+                    messagebox.showerror("Audio operation failed", payload)
         except queue.Empty:
             pass
         self.after(100, self._poll_queue)

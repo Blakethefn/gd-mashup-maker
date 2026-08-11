@@ -163,8 +163,10 @@ def vocals_over_instrumental(
     other, optionally tempo/key match the vocals, then mix."""
     import librosa
 
-    vocals_wav, _ = separation.separate_vocals(vocal_source_path, progress_callback)
-    _, instrumental_wav = separation.separate_vocals(instrumental_source_path, progress_callback)
+    # Separation is an explicit pre-processing concern.  This compatibility
+    # renderer may consume the cache, but it must never start Demucs itself.
+    vocals_wav, _ = separation.get_prepared_vocals(vocal_source_path)
+    _, instrumental_wav = separation.get_prepared_vocals(instrumental_source_path)
 
     y_vocals, sr_vocals = audio_io.load_mono_float(vocals_wav)
 
@@ -525,8 +527,10 @@ def stem_mix(
 
     stem_overrides = stem_overrides or []
 
-    primary_stem_paths = separation.separate_stems(primary_path, progress_callback)
-    secondary_stem_paths = separation.separate_stems(secondary_path, progress_callback)
+    # Cache-only lookups keep this legacy compatibility function on the same
+    # preparation/render boundary as the real-time graph.
+    primary_stem_paths = separation.get_prepared_stems(primary_path)
+    secondary_stem_paths = separation.get_prepared_stems(secondary_path)
 
     if progress_callback:
         progress_callback("Detecting tempo...")
