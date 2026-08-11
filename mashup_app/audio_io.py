@@ -26,6 +26,13 @@ def load_mono_float(path: str, sr: int | None = None) -> tuple[np.ndarray, int]:
     return y, sr
 
 
+def segment_to_float_mono(segment: AudioSegment) -> np.ndarray:
+    """Convert a single-channel AudioSegment to float32 samples in [-1, 1]."""
+    samples = np.array(segment.get_array_of_samples()).astype(np.float32)
+    max_val = float(1 << (8 * segment.sample_width - 1))
+    return samples / max_val
+
+
 def float_array_to_segment(samples: np.ndarray, sample_rate: int, sample_width: int = 2) -> AudioSegment:
     """Convert float32 samples in [-1, 1] back to a pydub AudioSegment.
 

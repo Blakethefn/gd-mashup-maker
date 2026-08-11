@@ -49,8 +49,8 @@ class MashupApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("MP3 Mashup Tool")
-        self.geometry("620x520")
-        self.resizable(False, False)
+        self.geometry("640x640")
+        self.resizable(True, True)
 
         self.primary_path = tk.StringVar()
         self.secondary_path = tk.StringVar()
@@ -60,6 +60,16 @@ class MashupApp(tk.Tk):
         self.vocals_from_var = tk.StringVar(value="Secondary")
         self.tempo_match_var = tk.BooleanVar(value=True)
         self.key_match_var = tk.BooleanVar(value=True)
+
+        # "Make it actually blend" controls, shared in spirit across modes:
+        # match loudness, carve out competing frequencies, duck the
+        # background track under the foreground one.
+        self.simple_match_loudness_var = tk.BooleanVar(value=True)
+        self.simple_low_cut_var = tk.BooleanVar(value=True)
+        self.beat_match_loudness_var = tk.BooleanVar(value=True)
+        self.beat_low_cut_var = tk.BooleanVar(value=True)
+        self.vocals_match_loudness_var = tk.BooleanVar(value=True)
+        self.vocals_carve_var = tk.BooleanVar(value=True)
 
         self.render_queue: queue.Queue = queue.Queue()
         self.last_output_path = None
@@ -117,6 +127,15 @@ class MashupApp(tk.Tk):
         self.simple_secondary_gain.pack(fill="x", pady=4, padx=8)
         self.simple_crossfade = LabeledScale(frame, "Crossfade", 0, 8000, 1000, unit=" ms")
         self.simple_crossfade.pack(fill="x", pady=4, padx=8)
+
+        blend_row = ttk.Frame(frame)
+        blend_row.pack(fill="x", pady=(8, 4), padx=8)
+        ttk.Checkbutton(blend_row, text="Match loudness", variable=self.simple_match_loudness_var).pack(side="left")
+        ttk.Checkbutton(
+            blend_row, text="Low-cut secondary bass (avoid muddy overlap)", variable=self.simple_low_cut_var
+        ).pack(side="left", padx=12)
+        self.simple_duck_amount = LabeledScale(frame, "Duck primary under secondary", 0, 100, 30, unit="%")
+        self.simple_duck_amount.pack(fill="x", pady=4, padx=8)
         return frame
 
     def _build_beat_synced_frame(self):
@@ -136,6 +155,15 @@ class MashupApp(tk.Tk):
         self.beat_primary_gain.pack(fill="x", pady=4, padx=8)
         self.beat_secondary_gain = LabeledScale(frame, "Secondary gain", -20, 6, 0, unit=" dB", fmt="{:.1f}")
         self.beat_secondary_gain.pack(fill="x", pady=4, padx=8)
+
+        blend_row = ttk.Frame(frame)
+        blend_row.pack(fill="x", pady=(8, 4), padx=8)
+        ttk.Checkbutton(blend_row, text="Match loudness", variable=self.beat_match_loudness_var).pack(side="left")
+        ttk.Checkbutton(
+            blend_row, text="Low-cut secondary bass (avoid muddy overlap)", variable=self.beat_low_cut_var
+        ).pack(side="left", padx=12)
+        self.beat_duck_amount = LabeledScale(frame, "Duck primary under secondary", 0, 100, 30, unit="%")
+        self.beat_duck_amount.pack(fill="x", pady=4, padx=8)
         return frame
 
     def _build_vocals_frame(self):
@@ -160,6 +188,15 @@ class MashupApp(tk.Tk):
         self.vocals_gain.pack(fill="x", pady=4, padx=8)
         self.instrumental_gain = LabeledScale(frame, "Instrumental gain", -20, 6, 0, unit=" dB", fmt="{:.1f}")
         self.instrumental_gain.pack(fill="x", pady=4, padx=8)
+
+        blend_row = ttk.Frame(frame)
+        blend_row.pack(fill="x", pady=(8, 4), padx=8)
+        ttk.Checkbutton(blend_row, text="Match loudness", variable=self.vocals_match_loudness_var).pack(side="left")
+        ttk.Checkbutton(
+            blend_row, text="Carve instrumental for vocal presence (~2.5kHz)", variable=self.vocals_carve_var
+        ).pack(side="left", padx=12)
+        self.vocals_duck_amount = LabeledScale(frame, "Duck instrumental under vocals", 0, 100, 50, unit="%")
+        self.vocals_duck_amount.pack(fill="x", pady=4, padx=8)
 
         note = ttk.Label(
             frame,
@@ -285,6 +322,10 @@ class MashupApp(tk.Tk):
                     primary_gain_db=self.simple_primary_gain.get(),
                     secondary_gain_db=self.simple_secondary_gain.get(),
                     crossfade_ms=int(self.simple_crossfade.get()),
+                    match_loudness=self.simple_match_loudness_var.get(),
+                    low_cut_secondary=self.simple_low_cut_var.get(),
+                    duck_amount=self.simple_duck_amount.get() / 100.0,
+                    progress_callback=self._queue_status,
                 )
             elif mode == MODE_BEAT_SYNCED:
                 segment = mixer.beat_synced_blend(
@@ -294,6 +335,9 @@ class MashupApp(tk.Tk):
                     blend_duration_ms=int(self.beat_duration.get()),
                     primary_gain_db=self.beat_primary_gain.get(),
                     secondary_gain_db=self.beat_secondary_gain.get(),
+                    match_loudness=self.beat_match_loudness_var.get(),
+                    low_cut_secondary=self.beat_low_cut_var.get(),
+                    duck_amount=self.beat_duck_amount.get() / 100.0,
                     progress_callback=self._queue_status,
                 )
             else:  # MODE_VOCALS
@@ -309,6 +353,9 @@ class MashupApp(tk.Tk):
                     offset_ms=int(self.vocals_offset.get()),
                     vocal_gain_db=self.vocals_gain.get(),
                     instrumental_gain_db=self.instrumental_gain.get(),
+                    match_loudness=self.vocals_match_loudness_var.get(),
+                    carve_for_vocal=self.vocals_carve_var.get(),
+                    duck_amount=self.vocals_duck_amount.get() / 100.0,
                     progress_callback=self._queue_status,
                 )
 

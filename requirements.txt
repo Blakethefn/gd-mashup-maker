@@ -2,4 +2,5 @@ pydub
 librosa
 soundfile
 numpy
+scipy
 demucs
