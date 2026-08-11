@@ -1,0 +1,5 @@
+pydub
+librosa
+soundfile
+numpy
+demucs
