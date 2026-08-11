@@ -4,18 +4,19 @@ torch/demucs are only imported inside the functions below (lazy import) so
 that modes 1 and 2 never pay the cost of loading them.
 """
 import hashlib
+import shutil
 from pathlib import Path
 from typing import Callable, Optional
 
 STEMS_DIR = Path(__file__).resolve().parent.parent / "output" / ".stems"
 MODEL_NAME = "htdemucs"
+SHORT_NAME = "src"  # fixed short stand-in name so long source filenames never end up in the path
 
 
 def _cache_key(path: str) -> str:
     p = Path(path).resolve()
     stat = p.stat()
-    digest = hashlib.sha1(f"{p}:{stat.st_size}:{stat.st_mtime}".encode()).hexdigest()[:16]
-    return f"{p.stem}_{digest}"
+    return hashlib.sha1(f"{p}:{stat.st_size}:{stat.st_mtime}".encode()).hexdigest()[:16]
 
 
 def separate_vocals(path: str, progress_callback: Optional[Callable[[str], None]] = None) -> tuple[str, str]:
@@ -27,9 +28,8 @@ def separate_vocals(path: str, progress_callback: Optional[Callable[[str], None]
     """
     key = _cache_key(path)
     out_dir = STEMS_DIR / key
-    stem_name = Path(path).stem
-    vocals_path = out_dir / MODEL_NAME / stem_name / "vocals.wav"
-    other_path = out_dir / MODEL_NAME / stem_name / "no_vocals.wav"
+    vocals_path = out_dir / MODEL_NAME / SHORT_NAME / "vocals.wav"
+    other_path = out_dir / MODEL_NAME / SHORT_NAME / "no_vocals.wav"
 
     if vocals_path.exists() and other_path.exists():
         return str(vocals_path), str(other_path)
@@ -40,6 +40,13 @@ def separate_vocals(path: str, progress_callback: Optional[Callable[[str], None]
 
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # Demucs names its own output subfolder after the input file's stem, so a
+    # long source filename (e.g. a full song title) combined with our cache
+    # path can exceed Windows' 260-char MAX_PATH and fail with WinError 3.
+    # Feed it a short, fixed-name copy instead.
+    short_src = out_dir / f"{SHORT_NAME}{Path(path).suffix}"
+    shutil.copyfile(path, short_src)
+
     from demucs.separate import main as demucs_main
 
     try:
@@ -47,10 +54,12 @@ def separate_vocals(path: str, progress_callback: Optional[Callable[[str], None]
             "--two-stems", "vocals",
             "-n", MODEL_NAME,
             "-o", str(out_dir),
-            str(path),
+            str(short_src),
         ])
     except SystemExit as exc:
         raise RuntimeError(f"Demucs failed to process {path}: {exc}") from exc
+    finally:
+        short_src.unlink(missing_ok=True)
 
     if not vocals_path.exists() or not other_path.exists():
         raise RuntimeError(f"Demucs did not produce the expected output under {out_dir}")
