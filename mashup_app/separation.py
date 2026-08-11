@@ -15,10 +15,65 @@ SHORT_NAME = "src"  # fixed short stand-in name so long source filenames never e
 STEM_NAMES = ("vocals", "drums", "bass", "other")
 
 
+class StemsNotPreparedError(RuntimeError):
+    """Raised when a mixer asks for stems that have not been prepared yet."""
+
+
 def _cache_key(path: str) -> str:
     p = Path(path).resolve()
     stat = p.stat()
     return hashlib.sha1(f"{p}:{stat.st_size}:{stat.st_mtime}".encode()).hexdigest()[:16]
+
+
+def source_cache_key(path: str) -> str:
+    """Public, stable cache identity for one version of a source file."""
+    return _cache_key(path)
+
+
+def get_prepared_vocals(path: str) -> tuple[str, str]:
+    """Return cached two-stem assets without ever starting Demucs.
+
+    Keeping this lookup separate from :func:`separate_vocals` is deliberate:
+    playback and final export may only consume prepared assets.  The explicit
+    pre-processing stage is the sole caller allowed to perform separation.
+    """
+    out_dir = STEMS_DIR / _cache_key(path) / MODEL_NAME / SHORT_NAME
+    vocals_path = out_dir / "vocals.wav"
+    other_path = out_dir / "no_vocals.wav"
+    if not vocals_path.exists() or not other_path.exists():
+        raise StemsNotPreparedError(
+            f"Stems for {Path(path).name} are not prepared. Run Pre-process Audio first."
+        )
+    return str(vocals_path), str(other_path)
+
+
+def get_prepared_stems(path: str) -> dict[str, str]:
+    """Return cached four-stem assets without ever starting Demucs."""
+    out_dir = STEMS4_DIR / _cache_key(path) / MODEL_NAME / SHORT_NAME
+    stem_paths = {name: out_dir / f"{name}.wav" for name in STEM_NAMES}
+    missing = [name for name, stem_path in stem_paths.items() if not stem_path.exists()]
+    if missing:
+        raise StemsNotPreparedError(
+            f"Stems for {Path(path).name} are not prepared ({', '.join(missing)} missing). "
+            "Run Pre-process Audio first."
+        )
+    return {name: str(stem_path) for name, stem_path in stem_paths.items()}
+
+
+def vocals_are_prepared(path: str) -> bool:
+    try:
+        get_prepared_vocals(path)
+        return True
+    except (OSError, StemsNotPreparedError):
+        return False
+
+
+def stems_are_prepared(path: str) -> bool:
+    try:
+        get_prepared_stems(path)
+        return True
+    except (OSError, StemsNotPreparedError):
+        return False
 
 
 def separate_vocals(path: str, progress_callback: Optional[Callable[[str], None]] = None) -> tuple[str, str]:
