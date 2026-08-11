@@ -251,6 +251,8 @@ def _resolve_regions(default_source: str, overrides: list, total_len_ms: int) ->
     breakpoints = {0, total_len_ms}
     clipped = []
     for ov in overrides:
+        if ov.get("mode", "replace") == "layer":
+            continue
         start = max(0, min(int(ov["start_ms"]), total_len_ms))
         end = max(0, min(int(ov["end_ms"]), total_len_ms))
         if end > start:
@@ -274,38 +276,145 @@ def _resolve_regions(default_source: str, overrides: list, total_len_ms: int) ->
 
 def _build_stem_track(
     default_source: str, overrides: list, primary_segment: AudioSegment, secondary_segment: AudioSegment,
-    total_len_ms: int, crossfade_ms: int = 900,
+    total_len_ms: int, crossfade_ms: int = 900, source_origins: Optional[Dict[str, int]] = None,
 ) -> AudioSegment:
-    """Concatenate the source regions for one stem, crossfading at every point
-    the source actually changes (whether from an explicit override or the
-    auto-fallback below) instead of hard-cutting - a straight concatenation
-    there is an instant volume/timbre jump. The crossfade window is split
-    evenly across the two neighboring regions so the stem's total length
-    still lands exactly on total_len_ms, keeping it aligned with every other
-    stem's timeline when they're all overlaid together.
+    """Build one playlist-style stem track without changing its total length.
+
+    Replace clips choose the source for their destination window. Layer clips
+    are mixed over that replacement/base track, allowing (for example) both
+    primary and secondary drums to play together. Clips with source_start_ms
+    carry their own track-local source in-point, so moving a clip moves its
+    audio and trimming/cutting can retain the correct source material. Legacy
+    overrides without that field keep their original absolute-time behavior.
     """
-    regions = _resolve_regions(default_source, overrides, total_len_ms)
+    origins = {"primary": 0, "secondary": 0}
+    if source_origins:
+        origins.update({name: int(value) for name, value in source_origins.items()})
+    sources = {"primary": primary_segment, "secondary": secondary_segment}
 
-    def src_for(source: str) -> AudioSegment:
-        return primary_segment if source == "primary" else secondary_segment
+    def source_names(source: str):
+        if source == "both":
+            return ("primary", "secondary")
+        if source == "muted":
+            return ()
+        return (source if source in sources else "primary",)
 
-    result = AudioSegment.silent(duration=0, frame_rate=primary_segment.frame_rate)
-    prev = None  # (start, end, source)
-    for start, end, source in regions:
+    def slice_padded(segment: AudioSegment, start_ms: int, end_ms: int) -> AudioSegment:
+        duration = max(0, int(end_ms - start_ms))
+        def matching_silence(length_ms):
+            return (
+                AudioSegment.silent(duration=length_ms, frame_rate=segment.frame_rate)
+                .set_channels(segment.channels)
+                .set_sample_width(segment.sample_width)
+            )
+        if duration == 0:
+            return matching_silence(0)
+        left_pad = max(0, -int(start_ms))
+        slice_start = max(0, int(start_ms))
+        slice_end = max(slice_start, int(end_ms))
+        piece = matching_silence(left_pad)
+        piece += segment[slice_start:slice_end]
+        return _pad_to(piece, duration)[:duration]
+
+    def descriptor_source(desc):
+        return default_source if desc is None else desc.get("source", "primary")
+
+    def source_position(desc, source: str, timeline_ms: int) -> int:
+        if desc is not None and "source_start_ms" in desc:
+            return origins[source] + int(desc["source_start_ms"]) + (timeline_ms - int(desc["start_ms"]))
+        # Old overrides and the default bed are aligned to final timeline
+        # time, including secondary's start-offset padding.
+        return timeline_ms
+
+    def slice_descriptor(desc, start_ms: int, end_ms: int) -> AudioSegment:
+        duration = max(0, end_ms - start_ms)
+        mixed = None
+        for source in source_names(descriptor_source(desc)):
+            source_start = source_position(desc, source, start_ms)
+            piece = slice_padded(sources[source], source_start, source_start + duration)
+            mixed = piece if mixed is None else mixed.overlay(piece)
+        if mixed is None:
+            mixed = (
+                AudioSegment.silent(duration=duration, frame_rate=primary_segment.frame_rate)
+                .set_channels(primary_segment.channels)
+                .set_sample_width(primary_segment.sample_width)
+            )
+        return _pad_to(mixed, duration)[:duration]
+
+    def descriptor_key(desc):
+        source = descriptor_source(desc)
+        offsets = []
+        for name in source_names(source):
+            if desc is not None and "source_start_ms" in desc:
+                offset = origins[name] + int(desc["source_start_ms"]) - int(desc["start_ms"])
+            else:
+                offset = 0
+            offsets.append((name, offset))
+        return tuple(offsets)
+
+    replacements = [ov for ov in overrides if ov.get("mode", "replace") != "layer"]
+    breakpoints = {0, total_len_ms}
+    for ov in replacements:
+        start = max(0, min(int(ov["start_ms"]), total_len_ms))
+        end = max(0, min(int(ov["end_ms"]), total_len_ms))
+        if end > start:
+            breakpoints.update((start, end))
+
+    regions = []
+    points = sorted(breakpoints)
+    for start, end in zip(points, points[1:]):
+        active = None
+        mid = (start + end) / 2
+        for ov in replacements:
+            if int(ov["start_ms"]) <= mid < int(ov["end_ms"]):
+                active = ov
+        regions.append((start, end, active))
+
+    result = primary_segment[:0]
+    prev = None  # (start, end, descriptor)
+    for start, end, desc in regions:
         seg_start = start
-        if prev is not None and prev[2] != source:
-            prev_start, prev_end, prev_source = prev
+        if prev is not None and descriptor_key(prev[2]) != descriptor_key(desc):
+            prev_start, prev_end, prev_desc = prev
             half = min(crossfade_ms, end - start, prev_end - prev_start) // 2
             if half > 0:
                 b = start
                 result = result[: len(result) - half]
-                outgoing = src_for(prev_source)[b - half:b + half].fade_out(2 * half)
-                incoming = src_for(source)[b - half:b + half].fade_in(2 * half)
+                outgoing = slice_descriptor(prev_desc, b - half, b + half).fade_out(2 * half)
+                incoming = slice_descriptor(desc, b - half, b + half).fade_in(2 * half)
                 result += outgoing.overlay(incoming)
                 seg_start = start + half
-        result += src_for(source)[seg_start:end]
-        prev = (start, end, source)
-    return result
+        result += slice_descriptor(desc, seg_start, end)
+        prev = (start, end, desc)
+
+    result = _pad_to(result, total_len_ms)[:total_len_ms]
+    layers = [ov for ov in overrides if ov.get("mode", "replace") == "layer"]
+    for ov in layers:
+        start = max(0, min(int(ov["start_ms"]), total_len_ms))
+        end = max(0, min(int(ov["end_ms"]), total_len_ms))
+        if end <= start:
+            continue
+        clip = slice_descriptor(ov, start, end)
+        fade = min(max(0, int(crossfade_ms)), len(clip) // 2)
+        if fade:
+            continues_from_previous = any(
+                other is not ov
+                and int(other["end_ms"]) == int(ov["start_ms"])
+                and descriptor_key(other) == descriptor_key(ov)
+                for other in layers
+            )
+            continues_into_next = any(
+                other is not ov
+                and int(other["start_ms"]) == int(ov["end_ms"])
+                and descriptor_key(other) == descriptor_key(ov)
+                for other in layers
+            )
+            if not continues_from_previous:
+                clip = clip.fade_in(fade)
+            if not continues_into_next:
+                clip = clip.fade_out(fade)
+        result = result.overlay(clip, position=start)
+    return _pad_to(result, total_len_ms)[:total_len_ms]
 
 
 def stem_mix(
@@ -327,13 +436,13 @@ def stem_mix(
     progress_callback: Optional[Callable[[str], None]] = None,
 ) -> AudioSegment:
     """Separate both tracks into vocals/drums/bass/other, pick each stem's
-    default source per stem_sources (e.g. {"vocals": "secondary", "drums":
-    "secondary", "bass": "primary", "other": "primary"}), then mix.
+    default source per stem_sources (primary, secondary, or both), then mix.
 
-    stem_overrides optionally swaps a stem's source for a specific time
-    window, e.g. [{"stem": "bass", "start_ms": 30000, "end_ms": 60000,
-    "source": "secondary"}] plays secondary's bass just for that 30s section
-    and the default elsewhere - so a single stem can switch source mid-song.
+    stem_overrides accepts playlist clips. mode="replace" chooses a source
+    for the window; mode="layer" mixes it over the default/replacement track.
+    source_start_ms is an optional track-local in-point retained when clips
+    move, trim, or split. Dicts without the new fields remain compatible with
+    the original absolute-time replacement behavior.
 
     auto_fallback (default on) additionally swaps a stem back to whichever
     source is still playing once its own default source's audio has ended -
@@ -431,18 +540,18 @@ def stem_mix(
                     "stem": name, "start_ms": primary_content_end,
                     "end_ms": secondary_content_end, "source": "secondary",
                 })
-    # Fallback regions come first so an explicit user override covering the
+    # Fallback regions come first so an explicit user clip covering the
     # same window still wins - _resolve_regions lets later entries win ties.
     effective_overrides = fallback_overrides + stem_overrides
 
     if duck_amount > 0:
         if progress_callback:
             progress_callback("Ducking...")
-        # Duck against the *default* secondary-sourced stems (overrides are a
+        # Duck against the *default* secondary-sourced stems (playlist clips are a
         # creative per-section choice and don't reshape the duck trigger).
         secondary_default_group = None
         for name in separation.STEM_NAMES:
-            if stem_sources.get(name, "primary") == "secondary":
+            if stem_sources.get(name, "primary") in ("secondary", "both"):
                 secondary_default_group = (
                     secondary_stems[name] if secondary_default_group is None
                     else secondary_default_group.overlay(secondary_stems[name])
@@ -454,7 +563,7 @@ def stem_mix(
             }
 
     if progress_callback:
-        progress_callback("Applying overrides and mixing...")
+        progress_callback("Applying playlist clips and mixing...")
 
     final = None
     for name in separation.STEM_NAMES:
@@ -463,6 +572,7 @@ def stem_mix(
         track = _build_stem_track(
             default_source, overrides_for_stem, primary_stems[name], secondary_stems[name], total_len,
             crossfade_ms=override_crossfade_ms,
+            source_origins={"primary": 0, "secondary": offset_ms},
         )
         final = track if final is None else final.overlay(track)
 
