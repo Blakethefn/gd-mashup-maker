@@ -274,30 +274,47 @@ def _resolve_regions(default_source: str, overrides: list, total_len_ms: int) ->
     return regions
 
 
+def _auto_fallback_clips(stem: str, bed: str, primary_end: int, secondary_end: int) -> list:
+    """Replacement clips that swap a stem back to whichever source is still
+    playing once its own bed's audio has ended - without them a stem sourced
+    from the shorter track goes silent for the rest of the song."""
+    if bed == "secondary" and secondary_end < primary_end:
+        return [{"stem": stem, "start_ms": secondary_end, "end_ms": primary_end, "source": "primary"}]
+    if bed == "primary" and primary_end < secondary_end:
+        return [{"stem": stem, "start_ms": primary_end, "end_ms": secondary_end, "source": "secondary"}]
+    return []
+
+
 def _build_stem_track(
-    default_source: str, overrides: list, primary_segment: AudioSegment, secondary_segment: AudioSegment,
+    default_source: str, overrides: list, sources: Dict[str, AudioSegment],
     total_len_ms: int, crossfade_ms: int = 900, source_origins: Optional[Dict[str, int]] = None,
 ) -> AudioSegment:
-    """Build one playlist-style stem track without changing its total length.
+    """Build one playlist track without changing its total length.
 
-    Replace clips choose the source for their destination window. Layer clips
-    are mixed over that replacement/base track, allowing (for example) both
-    primary and secondary drums to play together. Clips with source_start_ms
-    carry their own track-local source in-point, so moving a clip moves its
-    audio and trimming/cutting can retain the correct source material. Legacy
-    overrides without that field keep their original absolute-time behavior.
+    ``sources`` maps a lane name to the audio it feeds: stem tracks supply
+    "primary"/"secondary", imported audio tracks supply "import". Replace clips
+    choose the lane for their destination window. Layer clips are mixed over
+    that replacement/base track, allowing (for example) both primary and
+    secondary drums to play together. Clips with source_start_ms carry their
+    own track-local source in-point, so moving a clip moves its audio and
+    trimming/cutting can retain the correct source material. Legacy overrides
+    without that field keep their original absolute-time behavior.
     """
-    origins = {"primary": 0, "secondary": 0}
+    origins = {name: 0 for name in sources}
     if source_origins:
-        origins.update({name: int(value) for name, value in source_origins.items()})
-    sources = {"primary": primary_segment, "secondary": secondary_segment}
+        origins.update({name: int(value) for name, value in source_origins.items() if name in sources})
 
     def source_names(source: str):
         if source == "both":
-            return ("primary", "secondary")
+            return tuple(name for name in ("primary", "secondary") if name in sources)
+        if source in sources:
+            return (source,)
         if source == "muted":
             return ()
-        return (source if source in sources else "primary",)
+        # An unknown lane on a stem track keeps the original primary fallback.
+        return ("primary",) if "primary" in sources else ()
+
+    reference = next(iter(sources.values()))
 
     def slice_padded(segment: AudioSegment, start_ms: int, end_ms: int) -> AudioSegment:
         duration = max(0, int(end_ms - start_ms))
@@ -335,9 +352,9 @@ def _build_stem_track(
             mixed = piece if mixed is None else mixed.overlay(piece)
         if mixed is None:
             mixed = (
-                AudioSegment.silent(duration=duration, frame_rate=primary_segment.frame_rate)
-                .set_channels(primary_segment.channels)
-                .set_sample_width(primary_segment.sample_width)
+                AudioSegment.silent(duration=duration, frame_rate=reference.frame_rate)
+                .set_channels(reference.channels)
+                .set_sample_width(reference.sample_width)
             )
         return _pad_to(mixed, duration)[:duration]
 
@@ -370,7 +387,7 @@ def _build_stem_track(
                 active = ov
         regions.append((start, end, active))
 
-    result = primary_segment[:0]
+    result = reference[:0]
     prev = None  # (start, end, descriptor)
     for start, end, desc in regions:
         seg_start = start
@@ -422,6 +439,7 @@ def stem_mix(
     secondary_path: str,
     stem_sources: Dict[str, str],
     stem_overrides: Optional[list] = None,
+    timeline_tracks: Optional[list] = None,
     offset_ms: int = 0,
     primary_gain_db: float = 0.0,
     secondary_gain_db: float = 0.0,
@@ -435,14 +453,24 @@ def stem_mix(
     override_crossfade_ms: int = 900,
     progress_callback: Optional[Callable[[str], None]] = None,
 ) -> AudioSegment:
-    """Separate both tracks into vocals/drums/bass/other, pick each stem's
-    default source per stem_sources (primary, secondary, or both), then mix.
+    """Separate both tracks into vocals/drums/bass/other, then mix a playlist
+    of timeline tracks.
+
+    timeline_tracks describes the playlist: each entry is a dict with an "id",
+    a "kind" ("stem" or "audio"), the "stem" it draws from or the "path" it was
+    imported from, its full-song "bed" (primary/secondary/both/import/muted),
+    "gain_db", and "mute"/"solo" flags. Several tracks may share one stem -
+    that is what makes duplicated tracks and stacked clip lanes work. Omit it
+    and one track per stem is synthesized from stem_sources, which is the
+    original four-stem behavior.
 
     stem_overrides accepts playlist clips. mode="replace" chooses a source
     for the window; mode="layer" mixes it over the default/replacement track.
     source_start_ms is an optional track-local in-point retained when clips
-    move, trim, or split. Dicts without the new fields remain compatible with
-    the original absolute-time replacement behavior.
+    move, trim, or split. A clip's "track" field binds it to one timeline
+    track; clips without one fall back to the first track carrying their stem.
+    Dicts without the new fields remain compatible with the original
+    absolute-time replacement behavior.
 
     auto_fallback (default on) additionally swaps a stem back to whichever
     source is still playing once its own default source's audio has ended -
@@ -485,6 +513,20 @@ def stem_mix(
 
     secondary_stems = {name: load_secondary_stem(name) for name in separation.STEM_NAMES}
 
+    tracks = timeline_tracks or [
+        {
+            "id": name, "name": name, "kind": "stem", "stem": name,
+            "bed": stem_sources.get(name, "primary"), "gain_db": 0.0, "mute": False, "solo": False,
+        }
+        for name in separation.STEM_NAMES
+    ]
+    imported: Dict[str, AudioSegment] = {}
+    for track in tracks:
+        if track.get("kind") == "audio" and track.get("path") and track["id"] not in imported:
+            if progress_callback:
+                progress_callback(f"Loading imported track {track.get('name', track['id'])}...")
+            imported[track["id"]] = _normalize_format(AudioSegment.from_file(track["path"]))
+
     if match_loudness:
         # Adjust each source's stems by ONE gain (derived from the full
         # track's loudness), not per-stem, so the natural balance between
@@ -522,27 +564,15 @@ def stem_mix(
     # actually stops, used below to auto-fallback stems once their source runs out.
     primary_content_end = max((len(s) for s in primary_stems.values()), default=0)
     secondary_content_end = max((len(s) for s in secondary_stems.values()), default=0)
+    # The playlist runs as long as its longest content: either source song, an
+    # imported track playing as a full-song bed, or a clip placed past both.
     total_len = max(primary_content_end, secondary_content_end)
+    for track in tracks:
+        if track.get("kind") == "audio" and track.get("bed", "muted") != "muted":
+            total_len = max(total_len, len(imported.get(track["id"], AudioSegment.silent(duration=0))))
+    total_len = max([total_len] + [int(ov["end_ms"]) for ov in stem_overrides])
     primary_stems = {n: _pad_to(s, total_len) for n, s in primary_stems.items()}
     secondary_stems = {n: _pad_to(s, total_len) for n, s in secondary_stems.items()}
-
-    fallback_overrides = []
-    if auto_fallback:
-        for name in separation.STEM_NAMES:
-            default = stem_sources.get(name, "primary")
-            if default == "secondary" and secondary_content_end < primary_content_end:
-                fallback_overrides.append({
-                    "stem": name, "start_ms": secondary_content_end,
-                    "end_ms": primary_content_end, "source": "primary",
-                })
-            elif default == "primary" and primary_content_end < secondary_content_end:
-                fallback_overrides.append({
-                    "stem": name, "start_ms": primary_content_end,
-                    "end_ms": secondary_content_end, "source": "secondary",
-                })
-    # Fallback regions come first so an explicit user clip covering the
-    # same window still wins - _resolve_regions lets later entries win ties.
-    effective_overrides = fallback_overrides + stem_overrides
 
     if duck_amount > 0:
         if progress_callback:
@@ -565,15 +595,50 @@ def stem_mix(
     if progress_callback:
         progress_callback("Applying playlist clips and mixing...")
 
+    soloed = any(track.get("solo") for track in tracks)
+    claimed_stems = set()
     final = None
-    for name in separation.STEM_NAMES:
-        default_source = stem_sources.get(name, "primary")
-        overrides_for_stem = [ov for ov in effective_overrides if ov.get("stem") == name]
-        track = _build_stem_track(
-            default_source, overrides_for_stem, primary_stems[name], secondary_stems[name], total_len,
-            crossfade_ms=override_crossfade_ms,
-            source_origins={"primary": 0, "secondary": offset_ms},
-        )
-        final = track if final is None else final.overlay(track)
+    for track in tracks:
+        stem = track.get("stem")
+        # An untracked legacy clip belongs to the first track carrying its
+        # stem, so duplicating a track never duplicates its audio by accident.
+        first_for_stem = stem is not None and stem not in claimed_stems
+        claimed_stems.add(stem)
+        if track.get("mute") or (soloed and not track.get("solo")):
+            continue
 
-    return final if final is not None else AudioSegment.silent(duration=0)
+        if track.get("kind") == "audio":
+            segment = imported.get(track["id"])
+            if segment is None:
+                continue
+            sources = {"import": _pad_to(segment, total_len)}
+            origins = {"import": 0}
+        elif stem in primary_stems:
+            sources = {"primary": primary_stems[stem], "secondary": secondary_stems[stem]}
+            origins = {"primary": 0, "secondary": offset_ms}
+        else:
+            continue
+
+        bed = track.get("bed", "primary")
+        clips = [
+            ov for ov in stem_overrides
+            if ov.get("track") == track["id"]
+            or (not ov.get("track") and first_for_stem and ov.get("stem") == stem)
+        ]
+        # Fallback regions come first so an explicit user clip covering the
+        # same window still wins - later entries win ties when they overlap.
+        if track.get("kind") == "stem" and auto_fallback:
+            clips = _auto_fallback_clips(
+                stem, bed, primary_content_end, secondary_content_end
+            ) + clips
+
+        built = _build_stem_track(
+            bed, clips, sources, total_len,
+            crossfade_ms=override_crossfade_ms, source_origins=origins,
+        )
+        gain = float(track.get("gain_db", 0.0) or 0.0)
+        if abs(gain) > 0.01:
+            built = built.apply_gain(gain)
+        final = built if final is None else final.overlay(built)
+
+    return final if final is not None else AudioSegment.silent(duration=total_len)

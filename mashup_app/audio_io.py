@@ -13,6 +13,12 @@ def load_mp3(path: str) -> AudioSegment:
     return AudioSegment.from_file(path, format="mp3")
 
 
+def load_audio(path: str) -> AudioSegment:
+    """Load any format ffmpeg understands - used for playlist tracks imported
+    from disk, which are not necessarily mp3."""
+    return AudioSegment.from_file(path)
+
+
 def get_duration_ms(path: str) -> int:
     """Fast duration probe via ffprobe (reads container metadata, no decode).
 
@@ -29,7 +35,7 @@ def get_duration_ms(path: str) -> int:
         )
         return int(float(result.stdout.strip()) * 1000)
     except Exception:
-        return len(load_mp3(path))
+        return len(load_audio(path))
 
 
 def export_mp3(segment: AudioSegment, path: str, bitrate: str = "320k") -> None:

@@ -1,4 +1,5 @@
 """Tkinter GUI: pick two MP3s, choose a mashup mode, tweak its controls, render."""
+import itertools
 import json
 import os
 import queue
@@ -29,20 +30,89 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 MUSIC_DIR = str(Path.home() / "Music") if (Path.home() / "Music").exists() else str(Path.home())
 PREFS_PATH = PROJECT_ROOT / ".gui_prefs.json"
 
-# ---- palette ------------------------------------------------------------
-BG = "#f4f5f8"
-SURFACE = "#ffffff"
-BORDER = "#d9dce3"
-TEXT = "#1f2430"
-MUTED = "#6b7280"
-ACCENT = "#2563eb"
-ACCENT_ACTIVE = "#1d4ed8"
-ACCENT_TEXT = "#ffffff"
-SUCCESS = "#15803d"
-ERROR = "#b91c1c"
-TIMELINE_BG = "#eef1f6"
-TIMELINE_PRIMARY = "#64748b"
-TIMELINE_SECONDARY = ACCENT
+# ---- palette (dark DAW theme) -------------------------------------------
+# One dark palette drives every widget, canvas and menu in the app, so the
+# playlist no longer sits as a dark island inside a light dashboard.
+BG = "#0f1319"           # window background
+SURFACE = "#171c23"      # panels / grouped sections
+SURFACE_ALT = "#1e242d"  # entries, spinboxes, raised rows
+SURFACE_HI = "#28303b"   # hover / pressed
+BORDER = "#2a313b"
+BORDER_HI = "#39424f"
+TEXT = "#e6eaf1"
+MUTED = "#8f99a8"
+ACCENT = "#f0883b"       # FL-style amber
+ACCENT_ACTIVE = "#ff9d55"
+ACCENT_TEXT = "#14181e"
+SUCCESS = "#4ade80"
+ERROR = "#f87171"
+TIMELINE_BG = "#12161c"
+TIMELINE_PRIMARY = "#c87c2e"
+TIMELINE_SECONDARY = "#2d7fc4"
+
+# ---- playlist canvas colors ---------------------------------------------
+PLAYLIST_BG = "#0b0e12"
+TRACK_BG = "#161b22"
+TRACK_BG_ALT = "#1a2029"
+TRACK_HEADER_BG = "#12161c"
+TRACK_HEADER_ACTIVE = "#202834"
+GRID_MINOR = "#232932"
+GRID_MAJOR = "#39414e"
+CLIP_COLORS = {"primary": "#c87c2e", "secondary": "#2d7fc4", "import": "#7a5bd0"}
+BED_COLORS = {"primary": "#3d2c17", "secondary": "#152e4a", "import": "#291f45"}
+LANE_LABELS = {"primary": "P", "secondary": "S", "import": "A"}
+LANE_TINTS = {"primary": "#f0a45c", "secondary": "#5fa8ec", "import": "#a68bec"}
+CLIP_SELECTED = "#ffd75e"
+PLAYHEAD_COLOR = "#ff6b4a"
+MODE_COLORS = {"layer": "#5fd68a", "replace": "#ff7b72"}
+
+STEM_LANES = ("primary", "secondary")
+AUDIO_LANES = ("import",)
+
+
+def _track_lanes(track):
+    """Sublanes a track exposes: stem tracks stack Primary over Secondary,
+    imported audio tracks carry a single lane fed by their own file."""
+    return AUDIO_LANES if track.get("kind") == "audio" else STEM_LANES
+
+
+_track_serial = itertools.count(1)
+
+
+def _new_track_id():
+    return f"trk{next(_track_serial)}"
+
+
+def make_stem_track(stem, name=None, bed=None):
+    """A timeline track fed by one separated stem of both source songs."""
+    return {
+        "id": _new_track_id(),
+        "name": name or stem.capitalize(),
+        "kind": "stem",
+        "stem": stem,
+        "path": None,
+        "bed": bed if bed is not None else STEM_DEFAULT_SOURCE[stem].lower(),
+        "gain_db": 0.0,
+        "mute": False,
+        "solo": False,
+    }
+
+
+def make_audio_track(path, name=None):
+    """A timeline track fed by an imported audio file. It starts clip-only
+    (bed "muted") so importing never silently drops a whole extra song on top
+    of the mashup - switch its bed to Import to play it end to end."""
+    return {
+        "id": _new_track_id(),
+        "name": name or Path(path).stem[:24],
+        "kind": "audio",
+        "stem": None,
+        "path": path,
+        "bed": "muted",
+        "gain_db": 0.0,
+        "mute": False,
+        "solo": False,
+    }
 
 
 def _load_prefs() -> dict:
@@ -91,8 +161,9 @@ class ToolTip:
         self.tip.wm_overrideredirect(True)
         self.tip.wm_geometry(f"+{x}+{y}")
         tk.Label(
-            self.tip, text=self.text, background="#1f2430", foreground="#ffffff",
+            self.tip, text=self.text, background=SURFACE_HI, foreground=TEXT,
             font=("Segoe UI", 8), padx=8, pady=5, wraplength=280, justify="left",
+            relief="solid", bd=1, highlightthickness=0,
         ).pack()
 
     def _hide(self, _evt=None):
@@ -211,25 +282,26 @@ class OffsetTimeline(tk.Canvas):
             self.on_offset_change(self.offset_ms)
 
 
-class StemSourceClip(tk.Label):
-    """A source chip that can be dragged onto a StemOverrideEditor lane."""
+class SourceChip(tk.Label):
+    """A browser chip that can be dragged onto a matching PlaylistEditor lane.
 
-    def __init__(self, parent, text, source, editor_getter, on_select=None, **kwargs):
-        color = "#277bd1" if source == "secondary" else "#d17a22"
+    ``source`` is the lane kind the chip produces ("primary", "secondary" or
+    "import"), which is also what decides which tracks will accept the drop.
+    """
+
+    def __init__(self, parent, text, source, editor_getter, **kwargs):
+        color = CLIP_COLORS.get(source, CLIP_COLORS["primary"])
         super().__init__(
-            parent, text=text, bg=color, fg="white", padx=12, pady=6,
+            parent, text=text, bg=color, fg="#ffffff", padx=10, pady=5,
             relief="flat", bd=0, cursor="hand2", font=("Segoe UI", 8, "bold"), **kwargs,
         )
         self.source = source
         self.editor_getter = editor_getter
-        self.on_select = on_select
         self.bind("<ButtonPress-1>", self._on_press)
         self.bind("<B1-Motion>", self._on_motion)
         self.bind("<ButtonRelease-1>", self._on_release)
 
     def _on_press(self, event):
-        if self.on_select:
-            self.on_select(self.source)
         fraction = event.x / max(1, self.winfo_width())
         self.editor_getter().begin_source_drag(self.source, fraction)
 
@@ -240,74 +312,85 @@ class StemSourceClip(tk.Label):
         self.editor_getter().end_source_drag(event.x_root, event.y_root, getattr(event, "state", 0))
 
 
-class StemOverrideEditor(tk.Canvas):
-    """Dark playlist editor with one Primary/Secondary sublane per stem.
+class PlaylistEditor(tk.Canvas):
+    """FL-Studio-style playlist canvas with dynamic tracks.
 
-    Clips use destination start/end plus a track-local source in-point. That
-    makes move, trim, and razor operations behave like audio clips rather than
-    absolute-time source switches. Legacy override dictionaries are still
-    understood and acquire the richer fields only when edited.
+    Tracks are created at runtime: a stem track stacks Primary over Secondary
+    sublanes, an imported audio track carries a single lane fed by its own
+    file. Clips store a destination window plus a track-local source in-point,
+    so move, trim, slip and split behave like real audio clips rather than
+    absolute-time source switches.
+
+    Editing is multi-clip throughout: marquee select, Alt-drag duplication,
+    copy/paste and split-at-playhead all act on the whole selection. A clip
+    plays whatever its lane feeds it, so dragging a clip onto another track
+    re-sources it - the same rule that makes duplicated tracks useful.
+
+    Legacy override dicts (no track/mode/source_start_ms) are adopted by the
+    first matching stem track and keep their original meaning.
     """
 
-    LABEL_W = 112
+    HEADER_W = 176
     EDGE_PX = 7
     MIN_LEN_MS = 250
     MIN_VIEW_MS = 1000
     RULER_H = 30
-    HISTORY_LIMIT = 50
+    HISTORY_LIMIT = 60
+    MAX_VISIBLE_TRACKS = 7
     ALT_MASK = 0x0008
-
-    BG = "#171a20"
-    TRACK_BG = "#20242c"
-    TRACK_BG_ALT = "#242932"
-    HEADER_BG = "#15181e"
-    GRID_MINOR = "#303641"
-    GRID_MAJOR = "#46505f"
-    PRIMARY_TINT = "#a65f16"
-    SECONDARY_TINT = "#185ca8"
-    SELECTED = "#f8d34f"
-    PLAYHEAD = "#ff7657"
+    SHIFT_MASK = 0x0001
+    CTRL_MASK = 0x0004
+    TOOLS = ("select", "draw", "razor")
+    TOOL_CURSORS = {"select": "", "draw": "crosshair", "razor": "X_cursor"}
 
     def __init__(
-        self, parent, stems, lane_h=58, get_default_source=None,
-        get_clip_length_ms=None, get_clip_mode=None, get_snap_enabled=None,
-        on_change=None, on_status=None, on_tool_change=None,
+        self, parent, get_clip_length_ms=None, get_clip_mode=None, get_snap_enabled=None,
+        on_change=None, on_status=None, on_tool_change=None, on_track_command=None, lane_h=58,
     ):
-        self.stems = list(stems)
         self.lane_h = lane_h
-        total_h = self.RULER_H + lane_h * len(self.stems)
+        self.tracks: list = []
+        self.clips: list = []
         super().__init__(
-            parent, height=total_h, bg=self.BG, takefocus=True,
-            highlightthickness=1, highlightbackground="#3a414d",
+            parent, height=self.RULER_H + lane_h * 4, bg=PLAYLIST_BG, takefocus=True,
+            highlightthickness=1, highlightbackground=BORDER_HI,
         )
         self.total_ms = 60000
         self.view_start_ms = 0.0
-        self.view_span_ms = float(self.total_ms)
+        self.view_span_ms = 60000.0
+        self.scroll_y = 0.0
         self.playhead_ms = 0.0
-        self.overrides: list = []
-        self.get_default_source = get_default_source or (lambda _stem: "primary")
+        self.tool = "select"
+        self.selection: list = []
+        self.clipboard: list = []
+        self.active_track_id = None
+
         self.get_clip_length_ms = get_clip_length_ms or (lambda: 8000)
         self.get_clip_mode = get_clip_mode or (lambda: "layer")
         self.get_snap_enabled = get_snap_enabled or (lambda: True)
         self.on_change = on_change
         self.on_status = on_status
         self.on_tool_change = on_tool_change
-        self._xscrollcommand = None
-        self.tool = "select"
+        self.on_track_command = on_track_command
 
         self.undo_stack: list = []
         self.redo_stack: list = []
         self._transaction_before = None
-        self._selected_ov = None
-        self._drag_mode = None  # None | create | move | resize-left | resize-right
-        self._drag_ov = None
+        self._drag_mode = None  # None|scrub|create|move|resize-left|resize-right|marquee
+        self._drag_clips: list = []  # [(live_clip, snapshot_taken_at_press)]
+        self._drag_ref = None
+        self._drag_ref_before = None
         self._drag_anchor_ms = 0.0
         self._drag_grab_offset_ms = 0.0
-        self._drag_len_ms = 0.0
-        self._drag_original = None
+        self._drag_slot_anchor = 0
+        self._drag_additive = None
+        self._marquee = None
         self._external_drag = None
-        self._feedback = None  # (x, y, text, guide_ms, lane)
+        self._feedback = None
         self._pan_anchor = None
+        self._header_hits: list = []
+        self._xscrollcommand = None
+        self._yscrollcommand = None
+        self._menu = None
 
         self.bind("<Configure>", lambda _e: self._redraw())
         self.bind("<ButtonPress-1>", self._on_press)
@@ -317,20 +400,104 @@ class StemOverrideEditor(tk.Canvas):
         self.bind("<Button-3>", self._on_right_click)
         self.bind("<Motion>", self._on_hover)
         self.bind("<Leave>", self._on_leave)
-        self.bind("<Control-z>", lambda _e: self.undo())
-        self.bind("<Control-y>", lambda _e: self.redo())
-        self.bind("<Control-Shift-Z>", lambda _e: self.redo())
-        self.bind("<Delete>", lambda _e: self.delete_selected())
-        self.bind("<Key-r>", lambda _e: self.set_tool("razor"))
-        self.bind("<Key-v>", lambda _e: self.set_tool("select"))
-        self.bind("<Escape>", self._cancel_interaction)
-        self.bind("<Control-MouseWheel>", self._on_zoom_wheel)
-        self.bind("<Shift-MouseWheel>", self._on_scroll_wheel)
         self.bind("<ButtonPress-2>", self._on_pan_press)
         self.bind("<B2-Motion>", self._on_pan_drag)
         self.bind("<ButtonRelease-2>", self._on_pan_release)
+        self.bind("<MouseWheel>", self._on_wheel)
+        self.bind("<Control-MouseWheel>", self._on_zoom_wheel)
+        self.bind("<Shift-MouseWheel>", self._on_scroll_wheel)
+        self.bind("<Control-z>", lambda _e: self.undo())
+        self.bind("<Control-y>", lambda _e: self.redo())
+        self.bind("<Control-Shift-Z>", lambda _e: self.redo())
+        self.bind("<Control-a>", lambda _e: self.select_all())
+        self.bind("<Control-c>", lambda _e: self.copy_selection())
+        self.bind("<Control-x>", lambda _e: self.cut_selection())
+        self.bind("<Control-v>", lambda _e: self.paste_clipboard())
+        self.bind("<Control-d>", lambda _e: self.duplicate_selection())
+        self.bind("<Delete>", lambda _e: self.delete_selected())
+        self.bind("<BackSpace>", lambda _e: self.delete_selected())
+        self.bind("<Key-v>", lambda _e: self.set_tool("select"))
+        self.bind("<Key-b>", lambda _e: self.set_tool("draw"))
+        self.bind("<Key-r>", lambda _e: self.set_tool("razor"))
+        self.bind("<Key-s>", lambda _e: self.split_at_playhead())
+        self.bind("<Escape>", self._cancel_interaction)
         self.bind("<Left>", lambda event: self._nudge_selected(event, -1))
         self.bind("<Right>", lambda event: self._nudge_selected(event, 1))
+        self.bind("<Up>", lambda _e: self._move_selection_slots(-1))
+        self.bind("<Down>", lambda _e: self._move_selection_slots(1))
+        self.bind("<Home>", lambda _e: self._set_playhead(0))
+        self.bind("<End>", lambda _e: self._set_playhead(self.total_ms))
+
+    # ---- track / clip model ---------------------------------------------
+
+    def set_tracks(self, tracks):
+        self.tracks = tracks
+        self._adopt_clips()
+        self._sync_height()
+        self._clamp_scroll_y()
+        self._redraw()
+
+    def set_clips(self, clips):
+        if clips is not self.clips:
+            self.clips = clips
+            self.undo_stack.clear()
+            self.redo_stack.clear()
+            self.selection = []
+        self._adopt_clips()
+        self._prune_selection()
+        self._redraw()
+
+    def _adopt_clips(self):
+        """Bind every clip to a real track id and a lane that track actually
+        has. That covers clips saved before tracks existed (matched by stem)
+        and clips left dangling by a removed track, so what the canvas draws is
+        always what the mixer will render."""
+        for clip in self.clips:
+            index = self._track_index_of(clip)
+            if index is None:
+                continue
+            track = self.tracks[index]
+            if clip.get("track") != track["id"]:
+                clip["track"] = track["id"]
+            lane = self._clip_lane(clip, track)
+            if clip.get("source") != lane:
+                clip["source"] = lane
+
+    def _track_index_of(self, clip):
+        track_id = clip.get("track")
+        if track_id:
+            for i, track in enumerate(self.tracks):
+                if track["id"] == track_id:
+                    return i
+        stem = clip.get("stem")
+        for i, track in enumerate(self.tracks):
+            if track.get("kind") == "stem" and track.get("stem") == stem:
+                return i
+        return None
+
+    def _clip_lane(self, clip, track):
+        lanes = _track_lanes(track)
+        source = clip.get("source", lanes[0])
+        return source if source in lanes else lanes[0]
+
+    def _clip_index(self, clip):
+        for i, existing in enumerate(self.clips):
+            if existing is clip:
+                return i
+        return -1
+
+    # Clip dicts are mutable and often equal-valued (a duplicate starts out
+    # identical to its original), so selection membership is by identity.
+    def _in_selection(self, clip):
+        return any(existing is clip for existing in self.selection)
+
+    def _prune_selection(self):
+        self.selection = [clip for clip in self.selection if self._clip_index(clip) >= 0]
+
+    def _is_silenced(self, track):
+        if track.get("mute"):
+            return True
+        return any(other.get("solo") for other in self.tracks) and not track.get("solo")
 
     # ---- public controls -------------------------------------------------
 
@@ -345,27 +512,24 @@ class StemOverrideEditor(tk.Canvas):
         self._clamp_view()
         self._redraw()
 
-    def set_overrides(self, overrides):
-        if overrides is not self.overrides:
-            self.overrides = overrides
-            self.undo_stack.clear()
-            self.redo_stack.clear()
-            self._selected_ov = None
-        self._redraw()
-
     def set_tool(self, tool):
-        if tool not in ("select", "razor"):
-            return
+        if tool not in self.TOOLS:
+            return "break"
         self.tool = tool
         if self.on_tool_change:
             self.on_tool_change(tool)
-        self.configure(cursor="crosshair" if tool == "razor" else "")
+        self.configure(cursor=self.TOOL_CURSORS[tool])
         self.focus_set()
         self._redraw()
+        return "break"
 
     def set_xscrollcommand(self, command):
         self._xscrollcommand = command
-        self._update_scrollbar()
+        self._update_scrollbars()
+
+    def set_yscrollcommand(self, command):
+        self._yscrollcommand = command
+        self._update_scrollbars()
 
     def xview(self, *args):
         if not args:
@@ -377,6 +541,17 @@ class StemOverrideEditor(tk.Canvas):
             step = self.view_span_ms * (0.85 if args[2] == "pages" else 0.1)
             self.view_start_ms += amount * step
         self._clamp_view()
+        self._redraw()
+
+    def yview(self, *args):
+        if not args:
+            return self._yview_fractions()
+        if args[0] == "moveto":
+            self.scroll_y = float(args[1]) * max(1, self._content_h())
+        elif args[0] == "scroll":
+            step = self.lane_h if args[2] == "units" else self._viewport_h()
+            self.scroll_y += int(args[1]) * step
+        self._clamp_scroll_y()
         self._redraw()
 
     def zoom_in(self, center_ms=None):
@@ -401,7 +576,7 @@ class StemOverrideEditor(tk.Canvas):
     def undo(self):
         if not self.undo_stack:
             return "break"
-        self.redo_stack.append(self._copy_overrides())
+        self.redo_stack.append(self._copy_clips())
         self._restore_snapshot(self.undo_stack.pop())
         self._notify_change("Undid edit")
         return "break"
@@ -409,29 +584,129 @@ class StemOverrideEditor(tk.Canvas):
     def redo(self):
         if not self.redo_stack:
             return "break"
-        self.undo_stack.append(self._copy_overrides())
+        self.undo_stack.append(self._copy_clips())
         self._restore_snapshot(self.redo_stack.pop())
         self._notify_change("Redid edit")
         return "break"
 
+    def select_all(self):
+        self.selection = list(self.clips)
+        self._set_status(f"Selected {len(self.selection)} clip{'s' if len(self.selection) != 1 else ''}")
+        self._redraw()
+        return "break"
+
     def delete_selected(self):
-        if self._selected_ov not in self.overrides:
+        if not self.selection:
             return "break"
+        count = len(self.selection)
         self._begin_transaction()
-        self.overrides.remove(self._selected_ov)
-        self._selected_ov = None
-        self._commit_transaction("Deleted clip")
+        keep = [clip for clip in self.clips if not self._in_selection(clip)]
+        self.clips[:] = keep
+        self.selection = []
+        self._commit_transaction(f"Deleted {count} clip{'s' if count != 1 else ''}")
         return "break"
 
     def delete_indices(self, indices):
-        valid = sorted({i for i in indices if 0 <= i < len(self.overrides)}, reverse=True)
+        valid = sorted({i for i in indices if 0 <= i < len(self.clips)}, reverse=True)
         if not valid:
             return
         self._begin_transaction()
         for index in valid:
-            del self.overrides[index]
-        self._selected_ov = None
+            del self.clips[index]
+        self._prune_selection()
         self._commit_transaction(f"Deleted {len(valid)} clip{'s' if len(valid) != 1 else ''}")
+
+    def copy_selection(self):
+        if not self.selection:
+            self._set_status("Nothing selected to copy")
+            return "break"
+        origin = min(int(clip["start_ms"]) for clip in self.selection)
+        self.clipboard = [dict(clip, _offset=int(clip["start_ms"]) - origin) for clip in self.selection]
+        self._set_status(f"Copied {len(self.clipboard)} clip{'s' if len(self.clipboard) != 1 else ''}")
+        return "break"
+
+    def cut_selection(self):
+        if not self.selection:
+            return "break"
+        self.copy_selection()
+        self.delete_selected()
+        return "break"
+
+    def paste_clipboard(self):
+        if not self.clipboard:
+            self._set_status("Clipboard is empty")
+            return "break"
+        self._begin_transaction()
+        pasted = []
+        for entry in self.clipboard:
+            clip = {key: value for key, value in entry.items() if key != "_offset"}
+            length = int(clip["end_ms"]) - int(clip["start_ms"])
+            start = int(max(0, min(self.total_ms - length, self.playhead_ms + entry["_offset"])))
+            clip["start_ms"] = start
+            clip["end_ms"] = start + length
+            if self._track_index_of(clip) is None and self.tracks:
+                target = self._active_track() or self.tracks[0]
+                self._retarget(clip, self.tracks.index(target), _track_lanes(target)[0])
+            pasted.append(clip)
+        self.clips.extend(pasted)
+        self.selection = pasted
+        self._commit_transaction(f"Pasted {len(pasted)} clip{'s' if len(pasted) != 1 else ''}")
+        return "break"
+
+    def duplicate_selection(self):
+        if not self.selection:
+            self._set_status("Select a clip first, then Ctrl+D to duplicate it")
+            return "break"
+        span = max(int(clip["end_ms"]) for clip in self.selection) - min(
+            int(clip["start_ms"]) for clip in self.selection
+        )
+        self._begin_transaction()
+        copies = []
+        for clip in self.selection:
+            copy = dict(clip)
+            length = int(copy["end_ms"]) - int(copy["start_ms"])
+            start = int(max(0, min(self.total_ms - length, int(copy["start_ms"]) + span)))
+            copy["start_ms"] = start
+            copy["end_ms"] = start + length
+            copies.append(copy)
+        self.clips.extend(copies)
+        self.selection = copies
+        self._commit_transaction(f"Duplicated {len(copies)} clip{'s' if len(copies) != 1 else ''}")
+        return "break"
+
+    def split_at_playhead(self):
+        playhead = int(round(self.playhead_ms))
+        targets = self.selection or self.clips
+        crossing = [
+            clip for clip in targets
+            if int(clip["start_ms"]) + self.MIN_LEN_MS <= playhead <= int(clip["end_ms"]) - self.MIN_LEN_MS
+        ]
+        if not crossing:
+            self._set_status("No clip crosses the playhead (needs 250 ms either side)")
+            return "break"
+        self._begin_transaction()
+        pieces = []
+        for clip in crossing:
+            pieces.extend(self._split_clip(clip, playhead))
+        self.selection = pieces
+        self._commit_transaction(f"Split {len(crossing)} clip{'s' if len(crossing) != 1 else ''}")
+        return "break"
+
+    def _split_clip(self, clip, split_ms):
+        """Replace clip with its two halves; the right half advances its source
+        in-point by the cut offset so the audio stays continuous."""
+        index = self._clip_index(clip)
+        if index < 0:
+            return []
+        source_start = self._clip_source_start(clip)
+        left = {**clip, "end_ms": split_ms, "source_start_ms": source_start, "mode": self._clip_mode(clip)}
+        right = {
+            **clip, "start_ms": split_ms,
+            "source_start_ms": source_start + split_ms - int(clip["start_ms"]),
+            "mode": self._clip_mode(clip),
+        }
+        self.clips[index:index + 1] = [left, right]
+        return [left, right]
 
     # ---- source-palette drag and drop -----------------------------------
 
@@ -452,24 +727,31 @@ class StemOverrideEditor(tk.Canvas):
             return
         x = root_x - self.winfo_rootx()
         y = root_y - self.winfo_rooty()
-        lane_info = self._lane_info(y)
-        if lane_info is None or x < self.LABEL_W or x > self.winfo_width():
+        info = self._lane_info(y)
+        if info is None or x < self.HEADER_W or x > self.winfo_width():
             self._external_drag["preview"] = None
             self._feedback = None
             self._redraw()
             return
-        lane, stem, _sublane_source = lane_info
+        index, track, _lane = info
         duration = self._external_drag["duration_ms"]
         raw_start = self._x_to_ms(x) - duration * self._external_drag["grab_fraction"]
         start = self._snap_point(raw_start, state)
         start = max(0.0, min(self.total_ms - duration, start))
         preview = {
-            "stem": stem, "start_ms": int(round(start)),
-            "end_ms": int(round(start + duration)), "source": self._external_drag["source"],
-            "source_start_ms": 0, "mode": self.get_clip_mode(),
+            "track": track["id"], "stem": track.get("stem"),
+            "start_ms": int(round(start)), "end_ms": int(round(start + duration)),
+            "source": self._external_drag["source"], "source_start_ms": 0,
+            "mode": self.get_clip_mode(),
         }
+        lanes = _track_lanes(track)
+        if preview["source"] not in lanes:
+            self._external_drag["preview"] = None
+            self._set_feedback(x, y, f"{track['name']} has no {preview['source']} lane", None, None)
+            self._redraw()
+            return
         self._external_drag["preview"] = preview
-        self._set_feedback(x, y, f"Drop {self._clip_summary(preview)}", start, lane)
+        self._set_feedback(x, y, f"Drop {self._clip_summary(preview)}", start, index)
         self._redraw()
 
     def end_source_drag(self, root_x, root_y, state=0):
@@ -481,8 +763,8 @@ class StemOverrideEditor(tk.Canvas):
         self._feedback = None
         if preview:
             self._begin_transaction()
-            self.overrides.append(preview)
-            self._selected_ov = preview
+            self.clips.append(preview)
+            self.selection = [preview]
             self._commit_transaction(f"Added {preview['source']} clip")
         else:
             self._set_status("Drop cancelled")
@@ -491,61 +773,102 @@ class StemOverrideEditor(tk.Canvas):
     # ---- coordinate mapping and viewport --------------------------------
 
     def _timeline_w(self):
-        return max(1, self.winfo_width() - self.LABEL_W)
+        return max(1, self.winfo_width() - self.HEADER_W)
 
     def _view_end_ms(self):
         return self.view_start_ms + self.view_span_ms
 
     def _ms_to_x(self, ms):
-        return self.LABEL_W + ((ms - self.view_start_ms) / self.view_span_ms) * self._timeline_w()
+        return self.HEADER_W + ((ms - self.view_start_ms) / self.view_span_ms) * self._timeline_w()
 
     def _x_to_ms(self, x):
-        fraction = (x - self.LABEL_W) / self._timeline_w()
+        fraction = (x - self.HEADER_W) / self._timeline_w()
         return max(0.0, min(self.total_ms, self.view_start_ms + fraction * self.view_span_ms))
 
-    def _lane_info(self, y):
+    def _content_h(self):
+        return len(self.tracks) * self.lane_h
+
+    def _viewport_h(self):
+        return max(self.lane_h, self.winfo_height() - self.RULER_H)
+
+    def _sync_height(self):
+        visible = max(1, min(len(self.tracks), self.MAX_VISIBLE_TRACKS))
+        wanted = self.RULER_H + visible * self.lane_h
+        if int(self.cget("height")) != wanted:
+            self.configure(height=wanted)
+
+    def _track_top(self, index):
+        return self.RULER_H + index * self.lane_h - self.scroll_y
+
+    def _track_at(self, y):
         if y < self.RULER_H:
             return None
-        relative_y = y - self.RULER_H
-        idx = int(relative_y // self.lane_h)
-        if not 0 <= idx < len(self.stems):
+        index = int((y - self.RULER_H + self.scroll_y) // self.lane_h)
+        return index if 0 <= index < len(self.tracks) else None
+
+    def _lane_info(self, y):
+        """(track_index, track, lane_name) under a canvas y, or None."""
+        index = self._track_at(y)
+        if index is None:
             return None
-        within = relative_y - idx * self.lane_h
-        source = "primary" if within < self.lane_h / 2 else "secondary"
-        return idx, self.stems[idx], source
+        track = self.tracks[index]
+        lanes = _track_lanes(track)
+        share = self.lane_h / len(lanes)
+        slot = int(max(0, min(len(lanes) - 1, (y - self._track_top(index)) // share)))
+        return index, track, lanes[slot]
 
-    def _lane_at(self, y):
-        info = self._lane_info(y)
-        return info[0] if info else None
+    def _lane_bounds(self, index, lane):
+        lanes = _track_lanes(self.tracks[index])
+        slot = lanes.index(lane) if lane in lanes else 0
+        share = self.lane_h / len(lanes)
+        top = self._track_top(index) + slot * share
+        return top + 2, top + share - 2
 
-    def _clip_y_bounds(self, stem, source):
-        lane = self.stems.index(stem)
-        track_top = self.RULER_H + lane * self.lane_h
-        half = self.lane_h / 2
-        top = track_top if source == "primary" else track_top + half
-        return top + 2, top + half - 2
+    def _lane_slots(self):
+        return [(i, lane) for i, track in enumerate(self.tracks) for lane in _track_lanes(track)]
 
-    @staticmethod
-    def _clip_mode(ov):
-        return ov.get("mode", "replace")
+    def _slot_of(self, clip):
+        index = self._track_index_of(clip)
+        if index is None:
+            return 0
+        lane = self._clip_lane(clip, self.tracks[index])
+        slots = self._lane_slots()
+        for position, slot in enumerate(slots):
+            if slot == (index, lane):
+                return position
+        return 0
 
-    @staticmethod
-    def _clip_source_start(ov):
-        return int(ov.get("source_start_ms", ov["start_ms"]))
+    def _retarget(self, clip, track_index, lane):
+        track = self.tracks[track_index]
+        clip["track"] = track["id"]
+        clip["stem"] = track.get("stem")
+        clip["source"] = lane
+
+    def _active_track(self):
+        for track in self.tracks:
+            if track["id"] == self.active_track_id:
+                return track
+        return self.tracks[0] if self.tracks else None
 
     def _clamp_view(self):
         self.view_span_ms = max(self.MIN_VIEW_MS, min(float(self.total_ms), self.view_span_ms))
         self.view_start_ms = max(0.0, min(self.total_ms - self.view_span_ms, self.view_start_ms))
 
-    def _view_fractions(self):
-        return (
-            self.view_start_ms / self.total_ms,
-            min(1.0, self._view_end_ms() / self.total_ms),
-        )
+    def _clamp_scroll_y(self):
+        self.scroll_y = max(0.0, min(max(0.0, self._content_h() - self._viewport_h()), self.scroll_y))
 
-    def _update_scrollbar(self):
+    def _view_fractions(self):
+        return (self.view_start_ms / self.total_ms, min(1.0, self._view_end_ms() / self.total_ms))
+
+    def _yview_fractions(self):
+        content = max(1, self._content_h())
+        return (self.scroll_y / content, min(1.0, (self.scroll_y + self._viewport_h()) / content))
+
+    def _update_scrollbars(self):
         if self._xscrollcommand:
             self._xscrollcommand(*self._view_fractions())
+        if self._yscrollcommand:
+            self._yscrollcommand(*self._yview_fractions())
 
     def _zoom(self, factor, center_ms=None):
         old_span = self.view_span_ms
@@ -569,6 +892,14 @@ class StemOverrideEditor(tk.Canvas):
         self.xview("scroll", -1 if event.delta > 0 else 1, "units")
         return "break"
 
+    def _on_wheel(self, event):
+        # Scroll tracks, and stop the event before the window-wide binding
+        # scrolls the whole dashboard out from under the pointer.
+        self.yview("scroll", -1 if event.delta > 0 else 1, "units")
+        return "break"
+
+    # ---- formatting -------------------------------------------------------
+
     @staticmethod
     def _fmt(ms):
         seconds = int(max(0, ms) // 1000)
@@ -583,20 +914,30 @@ class StemOverrideEditor(tk.Canvas):
     def _fmt_duration(self, ms):
         return self._fmt_precise(ms)
 
-    def _range_text(self, ov):
-        duration = ov["end_ms"] - ov["start_ms"]
+    @staticmethod
+    def _clip_mode(clip):
+        return clip.get("mode", "replace")
+
+    @staticmethod
+    def _clip_source_start(clip):
+        return int(clip.get("source_start_ms", clip["start_ms"]))
+
+    def _range_text(self, clip):
+        duration = clip["end_ms"] - clip["start_ms"]
         return (
-            f"{self._fmt_precise(ov['start_ms'])} - {self._fmt_precise(ov['end_ms'])}"
+            f"{self._fmt_precise(clip['start_ms'])} - {self._fmt_precise(clip['end_ms'])}"
             f"  ({self._fmt_duration(duration)})"
         )
 
-    def _clip_summary(self, ov):
-        duration = int(ov["end_ms"] - ov["start_ms"])
-        source_start = self._clip_source_start(ov)
+    def _clip_summary(self, clip):
+        duration = int(clip["end_ms"] - clip["start_ms"])
+        source_start = self._clip_source_start(clip)
+        index = self._track_index_of(clip)
+        track_name = self.tracks[index]["name"] if index is not None else "?"
         return (
-            f"{ov['source'].capitalize()} {ov['stem'].capitalize()} | {self._clip_mode(ov).capitalize()} | "
-            f"Timeline {self._range_text(ov)} | Source "
-            f"{self._fmt_precise(source_start)} - {self._fmt_precise(source_start + duration)}"
+            f"{track_name} | {clip.get('source', 'primary').capitalize()} | "
+            f"{self._clip_mode(clip).capitalize()} | Timeline {self._range_text(clip)} | "
+            f"Source {self._fmt_precise(source_start)} - {self._fmt_precise(source_start + duration)}"
         )
 
     # ---- snapping and hit testing ----------------------------------------
@@ -609,10 +950,12 @@ class StemOverrideEditor(tk.Canvas):
         ms = max(0.0, min(self.total_ms, ms))
         if not self._snap_active(event):
             return ms
-        candidates = [round(ms / 1000) * 1000, 0, self.total_ms]
-        for ov in self.overrides:
-            if ov is not exclude:
-                candidates.extend((ov["start_ms"], ov["end_ms"]))
+        candidates = [round(ms / 1000) * 1000, 0, self.total_ms, self.playhead_ms]
+        excluded = exclude if isinstance(exclude, (list, tuple)) else ([exclude] if exclude else [])
+        for clip in self.clips:
+            if any(clip is item for item in excluded):
+                continue
+            candidates.extend((clip["start_ms"], clip["end_ms"]))
         nearest = min(candidates, key=lambda candidate: abs(candidate - ms))
         threshold = max(25.0, min(250.0, self.view_span_ms / self._timeline_w() * 8))
         return float(nearest) if abs(nearest - ms) <= threshold else ms
@@ -624,58 +967,52 @@ class StemOverrideEditor(tk.Canvas):
         snapped_end = self._snap_point(start + length, event, exclude) - length
         return snapped_start if abs(snapped_start - start) <= abs(snapped_end - start) else snapped_end
 
-    def _region_at(self, stem, ms):
-        # Later entries win on overlap, matching mixer._resolve_regions.
-        for ov in reversed(self.overrides):
-            if ov["stem"] == stem and ov["start_ms"] <= ms <= ov["end_ms"]:
-                return ov
-        return None
+    def _clips_in_lane(self, index, lane):
+        track = self.tracks[index]
+        return [
+            clip for clip in self.clips
+            if self._track_index_of(clip) == index and self._clip_lane(clip, track) == lane
+        ]
 
     def _hit_test(self, event):
-        if event.x < self.LABEL_W:
-            return None, None
-        lane_info = self._lane_info(event.y)
-        if lane_info is None:
-            return None, None
-        _lane, stem, sublane_source = lane_info
+        if event.x < self.HEADER_W:
+            return None
+        info = self._lane_info(event.y)
+        if info is None:
+            return None
+        index, _track, lane = info
         ms = self._x_to_ms(event.x)
         edge_ms = self.EDGE_PX / self._timeline_w() * self.view_span_ms
-        # Test handles before interiors so both halves of an edge's visual
-        # hit area work, including the few pixels immediately outside a clip.
-        for ov in reversed(self.overrides):
-            if ov["stem"] != stem or ov.get("source", "primary") != sublane_source:
-                continue
-            if abs(ms - ov["start_ms"]) <= edge_ms:
-                return stem, ("resize-left", ov)
-            if abs(ms - ov["end_ms"]) <= edge_ms:
-                return stem, ("resize-right", ov)
-        for ov in reversed(self.overrides):
-            if (
-                ov["stem"] == stem
-                and ov.get("source", "primary") == sublane_source
-                and ov["start_ms"] <= ms <= ov["end_ms"]
-            ):
-                return stem, ("move", ov)
-        return stem, None
+        candidates = self._clips_in_lane(index, lane)
+        # Handles win over interiors so both sides of an edge are grabbable.
+        for clip in reversed(candidates):
+            if abs(ms - clip["start_ms"]) <= edge_ms:
+                return "resize-left", clip
+            if abs(ms - clip["end_ms"]) <= edge_ms:
+                return "resize-right", clip
+        for clip in reversed(candidates):
+            if clip["start_ms"] <= ms <= clip["end_ms"]:
+                return "move", clip
+        return None
 
     # ---- history ---------------------------------------------------------
 
-    def _copy_overrides(self):
-        return [dict(ov) for ov in self.overrides]
+    def _copy_clips(self):
+        return [dict(clip) for clip in self.clips]
 
     def _restore_snapshot(self, snapshot):
-        self.overrides[:] = [dict(ov) for ov in snapshot]
-        self._selected_ov = None
+        self.clips[:] = [dict(clip) for clip in snapshot]
+        self.selection = []
         self._redraw()
 
     def _begin_transaction(self):
         if self._transaction_before is None:
-            self._transaction_before = self._copy_overrides()
+            self._transaction_before = self._copy_clips()
 
     def _commit_transaction(self, message):
         before = self._transaction_before
         self._transaction_before = None
-        after = self._copy_overrides()
+        after = self._copy_clips()
         if before is None or before == after:
             self._redraw()
             return False
@@ -700,95 +1037,185 @@ class StemOverrideEditor(tk.Canvas):
                 return step
         return 300000
 
-    def _redraw(self):
-        self.delete("all")
-        w = max(1, self.winfo_width())
-        lane_bottom = self.RULER_H + len(self.stems) * self.lane_h
-        self.create_rectangle(0, 0, w, self.RULER_H, fill=self.HEADER_BG, outline="")
-        self.create_text(10, self.RULER_H / 2, text="PLAYLIST", anchor="w", fill="#d5d9e2", font=("Segoe UI", 8, "bold"))
-
-        for i, stem in enumerate(self.stems):
-            top = self.RULER_H + i * self.lane_h
-            bottom = top + self.lane_h
-            track_color = self.TRACK_BG if i % 2 == 0 else self.TRACK_BG_ALT
-            self.create_rectangle(self.LABEL_W, top, w, bottom, fill=track_color, outline="")
-            self.create_rectangle(0, top, self.LABEL_W, bottom, fill=self.HEADER_BG, outline="")
-            self.create_text(9, top + self.lane_h / 2, text=stem.upper(), anchor="w", fill="#f1f3f7", font=("Segoe UI", 8, "bold"))
-            self.create_text(self.LABEL_W - 13, top + self.lane_h * 0.25, text="P", fill="#f6a34b", font=("Segoe UI", 7, "bold"))
-            self.create_text(self.LABEL_W - 13, top + self.lane_h * 0.75, text="S", fill="#64a9f3", font=("Segoe UI", 7, "bold"))
-            self.create_line(self.LABEL_W, top + self.lane_h / 2, w, top + self.lane_h / 2, fill="#2b3039")
-            self.create_line(0, bottom, w, bottom, fill="#0e1014")
-
-            default = self.get_default_source(stem)
-            if default in ("primary", "both"):
-                self._draw_base_clip(stem, "primary")
-            if default in ("secondary", "both"):
-                self._draw_base_clip(stem, "secondary")
-
+    def _ticks(self):
         step = self._tick_interval()
         minor_step = max(25, step // 4)
-        first_minor = int(self.view_start_ms // minor_step) * minor_step
-        tick = first_minor
+        tick = int(self.view_start_ms // minor_step) * minor_step
         while tick <= self._view_end_ms() + minor_step:
             if tick >= self.view_start_ms:
-                x = self._ms_to_x(tick)
-                major = tick % step == 0
-                color = self.GRID_MAJOR if major else self.GRID_MINOR
-                self.create_line(x, self.RULER_H, x, lane_bottom, fill=color, width=1)
-                self.create_line(x, self.RULER_H - (9 if major else 5), x, self.RULER_H, fill=color)
-                if major:
-                    self.create_text(
-                        x + 3, 4, text=self._fmt_precise(tick), anchor="nw",
-                        fill="#b7bdc8", font=("Consolas", 7),
-                    )
+                yield tick, self._ms_to_x(tick), tick % step == 0
             tick += minor_step
 
-        for ov in self.overrides:
-            self._draw_clip(ov, selected=(ov is self._selected_ov))
+    def _redraw(self):
+        self.delete("all")
+        self._header_hits = []
+        w = max(1, self.winfo_width())
+        h = max(1, self.winfo_height())
+        self.create_rectangle(0, self.RULER_H, w, h, fill=PLAYLIST_BG, outline="")
 
+        visible = [
+            (index, track) for index, track in enumerate(self.tracks)
+            if self._track_top(index) + self.lane_h >= self.RULER_H and self._track_top(index) <= h
+        ]
+        for index, track in visible:
+            self._draw_track_body(index, track, w)
+        for _tick, x, major in self._ticks():
+            self.create_line(x, self.RULER_H, x, h, fill=GRID_MAJOR if major else GRID_MINOR)
+
+        for clip in self.clips:
+            self._draw_clip(clip, selected=self._in_selection(clip))
         if self._external_drag and self._external_drag.get("preview"):
             self._draw_clip(self._external_drag["preview"], ghost=True)
 
-        self.create_line(self.LABEL_W, 0, self.LABEL_W, lane_bottom, fill="#505867", width=1)
-        playhead_x = self._ms_to_x(self.playhead_ms)
-        if self.LABEL_W <= playhead_x <= w:
-            self.create_line(playhead_x, self.RULER_H - 2, playhead_x, lane_bottom, fill=self.PLAYHEAD, width=2)
-            self.create_polygon(
-                playhead_x - 5, self.RULER_H - 10, playhead_x + 5, self.RULER_H - 10,
-                playhead_x, self.RULER_H - 2, fill=self.PLAYHEAD, outline="",
+        for index, track in visible:
+            if self._is_silenced(track):
+                top = self._track_top(index)
+                self.create_rectangle(
+                    self.HEADER_W, top, w, top + self.lane_h,
+                    fill=PLAYLIST_BG, outline="", stipple="gray50",
+                )
+        if self._marquee:
+            x0, y0, x1, y1 = self._marquee
+            self.create_rectangle(
+                min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1),
+                outline=CLIP_SELECTED, width=1, dash=(3, 3),
             )
-        if self._feedback:
-            x, y, text, guide_ms, lane = self._feedback
-            if guide_ms is not None and lane is not None:
-                guide_x = self._ms_to_x(guide_ms)
-                top = self.RULER_H + lane * self.lane_h
-                self.create_line(guide_x, top, guide_x, top + self.lane_h, fill=self.SELECTED, width=2)
-            self._draw_feedback(x, y, text)
-        self._update_scrollbar()
+        for index, track in visible:
+            self._draw_track_header(index, track)
 
-    def _draw_base_clip(self, stem, source):
-        top, bottom = self._clip_y_bounds(stem, source)
-        x0, x1 = self.LABEL_W + 1, self.winfo_width() - 1
-        fill = "#4c351e" if source == "primary" else "#17395f"
-        self.create_rectangle(x0, top, x1, bottom, fill=fill, outline="#59606c", dash=(2, 4))
+        self._draw_ruler(w)
+        self.create_line(self.HEADER_W, 0, self.HEADER_W, h, fill=BORDER_HI)
+        self._draw_playhead(w, h)
+        if self._feedback:
+            x, y, text, guide_ms, track_index = self._feedback
+            if guide_ms is not None and track_index is not None:
+                guide_x = self._ms_to_x(guide_ms)
+                top = self._track_top(track_index)
+                self.create_line(guide_x, top, guide_x, top + self.lane_h, fill=CLIP_SELECTED, width=2)
+            self._draw_feedback(x, y, text)
+        self._update_scrollbars()
+
+    def _draw_track_body(self, index, track, w):
+        top = self._track_top(index)
+        bottom = top + self.lane_h
+        self.create_rectangle(
+            self.HEADER_W, top, w, bottom,
+            fill=TRACK_BG if index % 2 == 0 else TRACK_BG_ALT, outline="",
+        )
+        lanes = _track_lanes(track)
+        share = self.lane_h / len(lanes)
+        bed = track.get("bed", "muted")
+        for slot, lane in enumerate(lanes):
+            if slot:
+                self.create_line(self.HEADER_W, top + slot * share, w, top + slot * share, fill="#212832")
+            if bed == lane or (bed == "both" and lane in STEM_LANES):
+                self._draw_bed(index, lane)
+        self.create_line(0, bottom, w, bottom, fill="#05070a")
+
+    def _draw_bed(self, index, lane):
+        top, bottom = self._lane_bounds(index, lane)
+        x0, x1 = self.HEADER_W + 1, self.winfo_width() - 1
+        self.create_rectangle(x0, top, x1, bottom, fill=BED_COLORS[lane], outline="#495261", dash=(2, 4))
         self.create_text(
-            x0 + 7, (top + bottom) / 2,
-            text=f"BASE  {source.upper()}", anchor="w", fill="#aeb5c0", font=("Segoe UI", 7, "bold"),
+            x0 + 7, (top + bottom) / 2, text=f"BED  {lane.upper()}", anchor="w",
+            fill="#98a2b1", font=("Segoe UI", 7, "bold"),
         )
 
-    def _draw_clip(self, ov, selected=False, ghost=False):
-        if ov["stem"] not in self.stems:
+    def _draw_track_header(self, index, track):
+        top = self._track_top(index)
+        bottom = top + self.lane_h
+        active = track["id"] == self.active_track_id
+        self.create_rectangle(
+            0, top, self.HEADER_W, bottom,
+            fill=TRACK_HEADER_ACTIVE if active else TRACK_HEADER_BG, outline="",
+        )
+        self.create_line(0, bottom, self.HEADER_W, bottom, fill="#05070a")
+        accent = LANE_TINTS["import"] if track.get("kind") == "audio" else ACCENT
+        self.create_rectangle(0, top + 1, 3, bottom - 1, fill=accent, outline="")
+
+        name = track.get("name") or "Track"
+        if len(name) > 17:
+            name = name[:16] + ".."
+        self.create_text(
+            10, top + 12, text=name, anchor="w",
+            fill=MUTED if self._is_silenced(track) else TEXT, font=("Segoe UI", 8, "bold"),
+        )
+        self.create_text(
+            10, top + 26, text=f"BED {track.get('bed', 'muted').upper()}", anchor="w",
+            fill=MUTED, font=("Segoe UI", 7),
+        )
+        self._draw_header_button("M", 10, top + 36, track, "mute", ERROR)
+        self._draw_header_button("S", 34, top + 36, track, "solo", ACCENT)
+        gain = float(track.get("gain_db", 0.0) or 0.0)
+        if abs(gain) > 0.05:
+            self.create_text(60, top + 43, text=f"{gain:+.1f} dB", anchor="w", fill=MUTED, font=("Consolas", 7))
+
+        self.create_line(self.HEADER_W - 22, top, self.HEADER_W - 22, bottom, fill="#20262f")
+        lanes = _track_lanes(track)
+        share = self.lane_h / len(lanes)
+        for slot, lane in enumerate(lanes):
+            self.create_text(
+                self.HEADER_W - 11, top + share * (slot + 0.5), text=LANE_LABELS[lane],
+                fill=LANE_TINTS[lane], font=("Segoe UI", 8, "bold"),
+            )
+
+    def _draw_header_button(self, label, x, y, track, key, color, w=20, h=14):
+        on = bool(track.get(key))
+        self.create_rectangle(
+            x, y, x + w, y + h, fill=color if on else SURFACE_ALT,
+            outline=color if on else BORDER_HI,
+        )
+        self.create_text(
+            x + w / 2, y + h / 2, text=label,
+            fill=ACCENT_TEXT if on else MUTED, font=("Segoe UI", 7, "bold"),
+        )
+        self._header_hits.append((x, y, x + w, y + h, key, track))
+
+    def _draw_ruler(self, w):
+        self.create_rectangle(0, 0, w, self.RULER_H, fill=TRACK_HEADER_BG, outline="")
+        self.create_line(0, self.RULER_H, w, self.RULER_H, fill=BORDER_HI)
+        self.create_text(
+            10, self.RULER_H / 2, text="PLAYLIST", anchor="w", fill=TEXT, font=("Segoe UI", 8, "bold")
+        )
+        self.create_text(
+            self.HEADER_W - 8, self.RULER_H / 2, text=self.tool.upper(), anchor="e",
+            fill=ACCENT, font=("Segoe UI", 7, "bold"),
+        )
+        for tick, x, major in self._ticks():
+            self.create_line(x, self.RULER_H - (9 if major else 5), x, self.RULER_H,
+                             fill=GRID_MAJOR if major else GRID_MINOR)
+            if major:
+                self.create_text(x + 3, 4, text=self._fmt_precise(tick), anchor="nw",
+                                 fill="#aeb7c4", font=("Consolas", 7))
+
+    def _draw_playhead(self, w, h):
+        x = self._ms_to_x(self.playhead_ms)
+        if not self.HEADER_W <= x <= w:
             return
-        x0, x1 = self._ms_to_x(ov["start_ms"]), self._ms_to_x(ov["end_ms"])
-        if x1 < self.LABEL_W or x0 > self.winfo_width():
+        self.create_line(x, self.RULER_H - 2, x, h, fill=PLAYHEAD_COLOR, width=2)
+        self.create_polygon(
+            x - 5, self.RULER_H - 10, x + 5, self.RULER_H - 10, x, self.RULER_H - 2,
+            fill=PLAYHEAD_COLOR, outline="",
+        )
+
+    def _draw_clip(self, clip, selected=False, ghost=False):
+        index = self._track_index_of(clip)
+        if index is None:
             return
-        source = ov.get("source", "primary")
-        top, bottom = self._clip_y_bounds(ov["stem"], "secondary" if source == "secondary" else "primary")
-        x0 = max(self.LABEL_W, x0)
+        track = self.tracks[index]
+        lane = self._clip_lane(clip, track)
+        top, bottom = self._lane_bounds(index, lane)
+        if bottom < self.RULER_H or top > self.winfo_height():
+            return
+        x0, x1 = self._ms_to_x(clip["start_ms"]), self._ms_to_x(clip["end_ms"])
+        if x1 < self.HEADER_W or x0 > self.winfo_width():
+            return
+        x0 = max(self.HEADER_W, x0)
         x1 = min(self.winfo_width(), x1)
-        color = "#277bd1" if source == "secondary" else "#d17a22"
-        mode_color = "#61d17a" if self._clip_mode(ov) == "layer" else "#ff7b72"
-        outline = self.SELECTED if selected or ghost else mode_color
+        color = CLIP_COLORS.get(lane, CLIP_COLORS["primary"])
+        outline = CLIP_SELECTED if selected or ghost else MODE_COLORS[
+            "layer" if self._clip_mode(clip) == "layer" else "replace"
+        ]
         item = _rounded_rect(
             self, x0, top, max(x0 + 3, x1), bottom, radius=3,
             fill=color, outline=outline, width=2 if selected or ghost else 1,
@@ -802,28 +1229,31 @@ class StemOverrideEditor(tk.Canvas):
         wave_x = int(x0) + 5
         wave_index = 0
         while wave_x < x1 - 4:
-            amplitude = 2 + ((wave_index * 7 + self.stems.index(ov["stem"]) * 3) % 8) / 2
-            self.create_line(wave_x, wave_mid - amplitude, wave_x, wave_mid + amplitude, fill="#ffffff", stipple="gray50")
+            amplitude = 2 + ((wave_index * 7 + index * 3) % 8) / 2
+            self.create_line(wave_x, wave_mid - amplitude, wave_x, wave_mid + amplitude,
+                             fill="#ffffff", stipple="gray50")
             wave_x += 5
             wave_index += 1
         if x1 - x0 > 68:
-            source_start = self._clip_source_start(ov)
-            label = f"{self._clip_mode(ov).upper()}  IN {self._fmt_precise(source_start)}"
-            self.create_text(x0 + 7, top + 3, text=label, anchor="nw", fill="white", font=("Segoe UI", 7, "bold"))
+            label = f"{self._clip_mode(clip).upper()}  IN {self._fmt_precise(self._clip_source_start(clip))}"
+            self.create_text(x0 + 7, top + 3, text=label, anchor="nw", fill="white",
+                             font=("Segoe UI", 7, "bold"))
 
     def _draw_feedback(self, x, y, text):
         use_right_anchor = x > self.winfo_width() * 0.62
         x = x - 12 if use_right_anchor else x + 12
-        x = max(self.LABEL_W + 4, min(self.winfo_width() - 8, x))
-        y = max(self.RULER_H + 4, min(self.RULER_H + len(self.stems) * self.lane_h - 24, y - 24))
-        anchor = "ne" if use_right_anchor else "nw"
-        text_id = self.create_text(x, y, text=text, anchor=anchor, fill="white", font=("Segoe UI", 8, "bold"))
+        x = max(self.HEADER_W + 4, min(self.winfo_width() - 8, x))
+        y = max(self.RULER_H + 4, min(self.winfo_height() - 24, y - 24))
+        text_id = self.create_text(
+            x, y, text=text, anchor="ne" if use_right_anchor else "nw",
+            fill=TEXT, font=("Segoe UI", 8, "bold"),
+        )
         box = self.bbox(text_id)
         if box:
             pad = 4
             bg = self.create_rectangle(
                 box[0] - pad, box[1] - pad, box[2] + pad, box[3] + pad,
-                fill=TEXT, outline="", tags="feedback-bg",
+                fill=SURFACE_HI, outline=BORDER_HI,
             )
             self.tag_lower(bg, text_id)
 
@@ -831,180 +1261,387 @@ class StemOverrideEditor(tk.Canvas):
 
     def _on_press(self, event):
         self.focus_set()
-        if event.y < self.RULER_H and event.x >= self.LABEL_W:
-            self._drag_mode = "scrub"
-            self.playhead_ms = self._snap_point(self._x_to_ms(event.x), event)
-            self._set_status(f"Playhead {self._fmt_precise(self.playhead_ms)}")
-            self._redraw()
+        if event.x < self.HEADER_W:
+            self._press_header(event)
             return
-        stem, hit = self._hit_test(event)
-        if stem is None:
+        if event.y < self.RULER_H:
+            self._drag_mode = "scrub"
+            self._set_playhead(self._snap_point(self._x_to_ms(event.x), event))
+            return
+        info = self._lane_info(event.y)
+        if info is None:
             self._drag_mode = None
             return
-        if self.tool == "razor" or (getattr(event, "state", 0) & 0x0001):
-            self._cut_at_event(event)
+        index, track, lane = info
+        self.active_track_id = track["id"]
+        hit = self._hit_test(event)
+        if self.tool == "razor":
+            self._razor_at(event)
             return
-        self._begin_transaction()
-        ms = self._x_to_ms(event.x)
         if hit is None:
-            lane_info = self._lane_info(event.y)
-            self._drag_mode = "create"
-            self._drag_anchor_ms = self._snap_point(ms, event)
-            ov = {
-                "stem": stem, "start_ms": self._drag_anchor_ms,
-                "end_ms": self._drag_anchor_ms, "source": lane_info[2],
-                "source_start_ms": 0, "mode": self.get_clip_mode(),
-            }
-            self.overrides.append(ov)
-            self._drag_ov = ov
-            self._selected_ov = ov
-        else:
-            mode, ov = hit
-            self._drag_mode = mode
-            self._drag_ov = ov
-            self._selected_ov = ov
-            self._drag_grab_offset_ms = ms - ov["start_ms"]
-            self._drag_len_ms = ov["end_ms"] - ov["start_ms"]
-        self._drag_original = dict(self._drag_ov)
+            if self.tool == "draw":
+                self._start_create(event, index, track, lane)
+            else:
+                self.selection = []
+                self._drag_mode = "marquee"
+                self._marquee = (event.x, event.y, event.x, event.y)
+                self._redraw()
+            return
+        self._start_clip_drag(event, hit)
+
+    def _start_create(self, event, index, track, lane):
+        self._begin_transaction()
+        anchor = self._snap_point(self._x_to_ms(event.x), event)
+        clip = {
+            "track": track["id"], "stem": track.get("stem"),
+            "start_ms": anchor, "end_ms": anchor, "source": lane,
+            "source_start_ms": 0, "mode": self.get_clip_mode(),
+        }
+        self.clips.append(clip)
+        self.selection = [clip]
+        self._drag_mode = "create"
+        self._drag_anchor_ms = anchor
+        self._drag_ref = clip
+        self._drag_clips = [(clip, dict(clip))]
+        self._redraw()
+
+    def _start_clip_drag(self, event, hit):
+        kind, clip = hit
+        state = getattr(event, "state", 0)
+        if state & self.CTRL_MASK:
+            if self._in_selection(clip):
+                self.selection = [other for other in self.selection if other is not clip]
+                self._drag_mode = None
+                self._redraw()
+                return
+            self.selection.append(clip)
+        elif state & self.SHIFT_MASK:
+            if not self._in_selection(clip):
+                self.selection.append(clip)
+        elif not self._in_selection(clip):
+            self.selection = [clip]
+
+        self._begin_transaction()
+        duplicating = bool(state & self.ALT_MASK) and kind == "move"
+        if duplicating:
+            copies = [dict(existing) for existing in self.selection]
+            grabbed_at = next((i for i, existing in enumerate(self.selection) if existing is clip), 0)
+            self.clips.extend(copies)
+            self.selection = copies
+            clip = copies[grabbed_at]
+            self._set_status("Alt-drag: dragging a copy")
+
+        group = self.selection if kind == "move" else [clip]
+        self._drag_mode = kind
+        self._drag_ref = clip
+        self._drag_ref_before = dict(clip)
+        self._drag_clips = [(existing, dict(existing)) for existing in group]
+        self._drag_grab_offset_ms = self._x_to_ms(event.x) - clip["start_ms"]
+        self._drag_slot_anchor = self._slot_of(clip)
         self._redraw()
 
     def _on_drag(self, event):
         if self._drag_mode is None:
             return
         if self._drag_mode == "scrub":
-            self.playhead_ms = self._snap_point(self._x_to_ms(event.x), event)
-            self._set_status(f"Playhead {self._fmt_precise(self.playhead_ms)}")
+            self._set_playhead(self._snap_point(self._x_to_ms(event.x), event))
+            return
+        if self._drag_mode == "marquee":
+            self._marquee = (self._marquee[0], self._marquee[1], event.x, event.y)
             self._redraw()
             return
         ms = self._x_to_ms(event.x)
-        ov = self._drag_ov
         if self._drag_mode == "create":
-            edge = self._snap_point(ms, event, ov)
-            ov["start_ms"] = min(self._drag_anchor_ms, edge)
-            ov["end_ms"] = max(self._drag_anchor_ms, edge)
+            clip = self._drag_ref
+            edge = self._snap_point(ms, event, clip)
+            clip["start_ms"] = min(self._drag_anchor_ms, edge)
+            clip["end_ms"] = max(self._drag_anchor_ms, edge)
         elif self._drag_mode == "move":
-            raw_start = ms - self._drag_grab_offset_ms
-            new_start = self._snap_move(raw_start, self._drag_len_ms, event, ov)
-            new_start = max(0.0, min(self.total_ms - self._drag_len_ms, new_start))
-            ov["start_ms"] = new_start
-            ov["end_ms"] = new_start + self._drag_len_ms
-            lane_info = self._lane_info(event.y)
-            if lane_info:
-                ov["stem"] = lane_info[1]
-            ov["source_start_ms"] = self._clip_source_start(self._drag_original)
-            ov["mode"] = self._clip_mode(self._drag_original)
+            self._drag_move(event, ms)
         elif self._drag_mode == "resize-left":
-            edge = self._snap_point(ms, event, ov)
-            original_start = int(self._drag_original["start_ms"])
-            original_source = self._clip_source_start(self._drag_original)
+            clip, before = self._drag_clips[0]
+            edge = self._snap_point(ms, event, clip)
+            original_start = int(before["start_ms"])
+            original_source = self._clip_source_start(before)
             earliest = max(0, original_start - original_source)
-            new_start = max(earliest, min(edge, ov["end_ms"] - self.MIN_LEN_MS))
-            ov["start_ms"] = new_start
-            ov["source_start_ms"] = original_source + int(round(new_start - original_start))
-            ov["mode"] = self._clip_mode(self._drag_original)
+            new_start = max(earliest, min(edge, clip["end_ms"] - self.MIN_LEN_MS))
+            clip["start_ms"] = new_start
+            clip["source_start_ms"] = original_source + int(round(new_start - original_start))
+            clip["mode"] = self._clip_mode(before)
         elif self._drag_mode == "resize-right":
-            edge = self._snap_point(ms, event, ov)
-            ov["end_ms"] = min(self.total_ms, max(edge, ov["start_ms"] + self.MIN_LEN_MS))
-            ov["source_start_ms"] = self._clip_source_start(self._drag_original)
-            ov["mode"] = self._clip_mode(self._drag_original)
-        self._set_feedback(event.x, event.y, self._clip_summary(ov), ms, self.stems.index(ov["stem"]))
+            clip, before = self._drag_clips[0]
+            edge = self._snap_point(ms, event, clip)
+            clip["end_ms"] = min(self.total_ms, max(edge, clip["start_ms"] + self.MIN_LEN_MS))
+            clip["source_start_ms"] = self._clip_source_start(before)
+            clip["mode"] = self._clip_mode(before)
+        reference = self._drag_ref if self._drag_ref is not None else self._drag_clips[0][0]
+        self._set_feedback(
+            event.x, event.y, self._clip_summary(reference), ms, self._track_index_of(reference)
+        )
         self._redraw()
+
+    def _drag_move(self, event, ms):
+        """Move every selected clip by one shared timeline delta and one shared
+        lane delta, so a multi-clip drag keeps the group's internal layout."""
+        before_ref = self._drag_ref_before
+        length = int(before_ref["end_ms"]) - int(before_ref["start_ms"])
+        raw_start = ms - self._drag_grab_offset_ms
+        exclude = [clip for clip, _snapshot in self._drag_clips]
+        new_start = self._snap_move(raw_start, length, event, exclude)
+        delta = new_start - int(before_ref["start_ms"])
+        lowest = min(int(snapshot["start_ms"]) for _clip, snapshot in self._drag_clips)
+        highest = max(int(snapshot["end_ms"]) for _clip, snapshot in self._drag_clips)
+        delta = max(-lowest, min(self.total_ms - highest, delta))
+
+        slots = self._lane_slots()
+        info = self._lane_info(event.y)
+        slot_delta = 0
+        if info is not None and slots:
+            index, _track, lane = info
+            target = next(
+                (position for position, slot in enumerate(slots) if slot == (index, lane)),
+                self._drag_slot_anchor,
+            )
+            slot_delta = target - self._drag_slot_anchor
+            starts = [self._slot_of(clip) for clip, _snapshot in self._drag_clips]
+            slot_delta = max(-min(starts), min(len(slots) - 1 - max(starts), slot_delta))
+
+        for clip, snapshot in self._drag_clips:
+            start = int(snapshot["start_ms"]) + delta
+            clip["start_ms"] = start
+            clip["end_ms"] = start + int(snapshot["end_ms"]) - int(snapshot["start_ms"])
+            clip["source_start_ms"] = self._clip_source_start(snapshot)
+            clip["mode"] = self._clip_mode(snapshot)
+            if slot_delta and slots:
+                position = max(0, min(len(slots) - 1, self._slot_of(clip) + slot_delta))
+                self._retarget(clip, *slots[position])
 
     def _on_release(self, _event):
         if self._drag_mode is None:
             return
-        if self._drag_mode == "scrub":
-            self._drag_mode = None
+        mode = self._drag_mode
+        self._drag_mode = None
+        self._feedback = None
+        if mode == "scrub":
             self._redraw()
             return
-        ov = self._drag_ov
-        mode = self._drag_mode
-        if mode == "create" and ov["end_ms"] - ov["start_ms"] < self.MIN_LEN_MS:
-            self.overrides.remove(ov)
-            self._selected_ov = None
-        elif ov is not None:
-            ov["start_ms"] = int(round(ov["start_ms"]))
-            ov["end_ms"] = int(round(ov["end_ms"]))
-        self._drag_mode = None
-        self._drag_ov = None
-        self._drag_original = None
-        self._feedback = None
+        if mode == "marquee":
+            self._finish_marquee()
+            return
+        if mode == "create":
+            clip = self._drag_ref
+            if clip["end_ms"] - clip["start_ms"] < self.MIN_LEN_MS:
+                index = self._clip_index(clip)
+                if index >= 0:
+                    del self.clips[index]
+                self.selection = []
+        for clip, _snapshot in self._drag_clips:
+            if self._clip_index(clip) >= 0:
+                clip["start_ms"] = int(round(clip["start_ms"]))
+                clip["end_ms"] = int(round(clip["end_ms"]))
+        self._drag_clips = []
+        self._drag_ref = None
+        self._drag_ref_before = None
         self._commit_transaction({
             "create": "Created clip", "move": "Moved clip",
             "resize-left": "Trimmed clip start", "resize-right": "Trimmed clip end",
         }.get(mode, "Edited clip"))
 
-    def _cut_at_event(self, event):
-        stem, hit = self._hit_test(event)
-        if not stem or not hit:
+    def _finish_marquee(self):
+        x0, y0, x1, y1 = self._marquee
+        self._marquee = None
+        left, right = sorted((self._x_to_ms(x0), self._x_to_ms(x1)))
+        top, bottom = sorted((y0, y1))
+        picked = []
+        for clip in self.clips:
+            index = self._track_index_of(clip)
+            if index is None:
+                continue
+            lane_top, lane_bottom = self._lane_bounds(index, self._clip_lane(clip, self.tracks[index]))
+            if lane_bottom < top or lane_top > bottom:
+                continue
+            if clip["end_ms"] >= left and clip["start_ms"] <= right:
+                picked.append(clip)
+        self.selection = picked
+        self._transaction_before = None
+        self._set_status(f"Selected {len(picked)} clip{'s' if len(picked) != 1 else ''}")
+        self._redraw()
+
+    def _razor_at(self, event):
+        hit = self._hit_test(event)
+        if hit is None:
             self._set_status("Razor: click inside a clip to split it")
             return
-        ov = hit[1]
-        split_ms = int(round(self._snap_point(self._x_to_ms(event.x), event, ov)))
-        if split_ms - ov["start_ms"] < self.MIN_LEN_MS or ov["end_ms"] - split_ms < self.MIN_LEN_MS:
+        clip = hit[1]
+        split_ms = int(round(self._snap_point(self._x_to_ms(event.x), event, clip)))
+        if split_ms - clip["start_ms"] < self.MIN_LEN_MS or clip["end_ms"] - split_ms < self.MIN_LEN_MS:
             self._set_status("Cut must leave at least 250 ms on both sides")
             return
         self._begin_transaction()
-        index = self.overrides.index(ov)
-        source_start = self._clip_source_start(ov)
-        left = {**ov, "end_ms": split_ms, "source_start_ms": source_start, "mode": self._clip_mode(ov)}
-        right = {
-            **ov, "start_ms": split_ms,
-            "source_start_ms": source_start + split_ms - int(ov["start_ms"]),
-            "mode": self._clip_mode(ov),
-        }
-        self.overrides[index:index + 1] = [left, right]
-        self._selected_ov = right
+        pieces = self._split_clip(clip, split_ms)
+        self.selection = pieces[-1:]
         self._feedback = None
-        self._commit_transaction(f"Cut {stem} at {self._fmt_precise(split_ms)}")
+        self._commit_transaction(f"Cut clip at {self._fmt_precise(split_ms)}")
+
+    def _press_header(self, event):
+        for x0, y0, x1, y1, key, track in self._header_hits:
+            if x0 <= event.x <= x1 and y0 <= event.y <= y1:
+                track[key] = not track.get(key)
+                self.active_track_id = track["id"]
+                self._redraw()
+                if self.on_track_command:
+                    self.on_track_command(key, track)
+                return
+        index = self._track_at(event.y)
+        if index is not None:
+            self.active_track_id = self.tracks[index]["id"]
+        self._drag_mode = None
+        self._redraw()
 
     def _on_double_click(self, event):
-        # Kept as a compatibility shortcut; the explicit Razor tool is the
-        # discoverable path and provides a live cut guide before clicking.
-        self._cut_at_event(event)
+        if event.x < self.HEADER_W:
+            index = self._track_at(event.y)
+            if index is not None and self.on_track_command:
+                self.on_track_command("rename", self.tracks[index])
+            return "break"
+        hit = self._hit_test(event)
+        if hit is not None:
+            clip = hit[1]
+            self._begin_transaction()
+            clip["mode"] = "replace" if self._clip_mode(clip) == "layer" else "layer"
+            self.selection = [clip]
+            self._commit_transaction(f"Clip set to {clip['mode'].capitalize()}")
         return "break"
 
     def _on_right_click(self, event):
-        _, hit = self._hit_test(event)
-        if hit:
-            self._selected_ov = hit[1]
-            self.delete_selected()
+        self.focus_set()
+        if event.x < self.HEADER_W:
+            index = self._track_at(event.y)
+            if index is not None:
+                self.active_track_id = self.tracks[index]["id"]
+                self._redraw()
+                self._popup(self._build_track_menu(self.tracks[index]), event)
+            return "break"
+        info = self._lane_info(event.y)
+        if info is None:
+            return "break"
+        self.active_track_id = info[1]["id"]
+        hit = self._hit_test(event)
+        if hit is not None and not self._in_selection(hit[1]):
+            self.selection = [hit[1]]
+            self._redraw()
+        self._popup(self._build_clip_menu(hit[1] if hit else None), event)
+        return "break"
+
+    def _new_menu(self):
+        return tk.Menu(
+            self, tearoff=0, bg=SURFACE_ALT, fg=TEXT, activebackground=ACCENT,
+            activeforeground=ACCENT_TEXT, bd=0, relief="flat",
+            disabledforeground=MUTED,
+        )
+
+    def _popup(self, menu, event):
+        if self._menu is not None:
+            self._menu.destroy()
+        self._menu = menu
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _build_clip_menu(self, clip):
+        menu = self._new_menu()
+        has_selection = bool(self.selection)
+        menu.add_command(label="Duplicate\tCtrl+D", command=self.duplicate_selection,
+                         state="normal" if has_selection else "disabled")
+        menu.add_command(label="Copy\tCtrl+C", command=self.copy_selection,
+                         state="normal" if has_selection else "disabled")
+        menu.add_command(label="Cut\tCtrl+X", command=self.cut_selection,
+                         state="normal" if has_selection else "disabled")
+        menu.add_command(label="Paste at playhead\tCtrl+V", command=self.paste_clipboard,
+                         state="normal" if self.clipboard else "disabled")
+        menu.add_separator()
+        menu.add_command(label="Split at playhead\tS", command=self.split_at_playhead)
+        if clip is not None:
+            other = "Replace" if self._clip_mode(clip) == "layer" else "Layer"
+            menu.add_command(label=f"Set to {other}", command=lambda: self._set_mode(clip, other.lower()))
+        menu.add_separator()
+        menu.add_command(label="Select all\tCtrl+A", command=self.select_all)
+        menu.add_command(label="Delete\tDel", command=self.delete_selected,
+                         state="normal" if has_selection else "disabled")
+        return menu
+
+    def _build_track_menu(self, track):
+        menu = self._new_menu()
+        menu.add_command(label=f"{track['name']}", state="disabled")
+        menu.add_separator()
+        beds = ("import", "muted") if track.get("kind") == "audio" else ("primary", "secondary", "both", "muted")
+        bed_menu = self._new_menu()
+        for bed in beds:
+            bed_menu.add_command(
+                label=bed.capitalize(),
+                command=lambda value=bed: self._track_command(f"bed:{value}", track),
+            )
+        menu.add_cascade(label="Full-song bed", menu=bed_menu)
+        menu.add_command(label="Rename...", command=lambda: self._track_command("rename", track))
+        menu.add_separator()
+        menu.add_command(label="Duplicate track", command=lambda: self._track_command("duplicate", track))
+        menu.add_command(label="Remove track", command=lambda: self._track_command("remove", track))
+        return menu
+
+    def _track_command(self, action, track):
+        if self.on_track_command:
+            self.on_track_command(action, track)
+
+    def _set_mode(self, clip, mode):
+        self._begin_transaction()
+        clip["mode"] = mode
+        self._commit_transaction(f"Clip set to {mode.capitalize()}")
 
     def _on_hover(self, event):
         if self._drag_mode is not None or self._external_drag:
             return
-        if event.y < self.RULER_H and event.x >= self.LABEL_W:
+        if event.x < self.HEADER_W:
+            self._feedback = None
+            self.configure(cursor="hand2" if event.y >= self.RULER_H else "")
+            self._redraw()
+            return
+        if event.y < self.RULER_H:
             ms = self._snap_point(self._x_to_ms(event.x), event)
             self.configure(cursor="hand2")
             self._set_feedback(event.x, self.RULER_H + 24, f"Playhead {self._fmt_precise(ms)}")
             self._redraw()
             return
-        stem, hit = self._hit_test(event)
-        lane = self._lane_at(event.y)
-        if stem is None:
+        info = self._lane_info(event.y)
+        if info is None:
             self._feedback = None
-            self.configure(cursor="crosshair" if self.tool == "razor" else "")
+            self.configure(cursor=self.TOOL_CURSORS[self.tool])
             self._redraw()
             return
+        index, _track, _lane = info
+        hit = self._hit_test(event)
         ms = self._snap_point(self._x_to_ms(event.x), event, hit[1] if hit else None)
-        use_razor = self.tool == "razor" or (getattr(event, "state", 0) & 0x0001)
-        if use_razor:
-            self.configure(cursor="crosshair")
+        if self.tool == "razor":
+            self.configure(cursor="X_cursor")
             text = f"Cut at {self._fmt_precise(ms)}" if hit else f"{self._fmt_precise(ms)}  (no clip)"
-            self._set_feedback(event.x, event.y, text, ms, lane)
+            self._set_feedback(event.x, event.y, text, ms, index)
         elif hit is None:
-            self.configure(cursor="crosshair")
-            self._set_feedback(event.x, event.y, f"Draw from {self._fmt_precise(ms)}", ms, lane)
+            self.configure(cursor=self.TOOL_CURSORS[self.tool])
+            text = (
+                f"Draw from {self._fmt_precise(ms)}" if self.tool == "draw"
+                else f"{self._fmt_precise(ms)}  (drag to marquee-select)"
+            )
+            self._set_feedback(event.x, event.y, text, ms, index)
         else:
-            mode, ov = hit
-            self.configure(cursor="fleur" if mode == "move" else "sb_h_double_arrow")
-            self._set_feedback(event.x, event.y, self._clip_summary(ov), ms, lane)
+            kind, clip = hit
+            self.configure(cursor="fleur" if kind == "move" else "sb_h_double_arrow")
+            self._set_feedback(event.x, event.y, self._clip_summary(clip), ms, index)
         self._redraw()
 
     def _on_leave(self, _event):
         if not self._external_drag:
             self._feedback = None
-            self.configure(cursor="crosshair" if self.tool == "razor" else "")
+            self.configure(cursor=self.TOOL_CURSORS[self.tool])
             self._redraw()
 
     def _cancel_interaction(self, _event=None):
@@ -1012,58 +1649,89 @@ class StemOverrideEditor(tk.Canvas):
             self._restore_snapshot(self._transaction_before)
         self._transaction_before = None
         self._drag_mode = None
-        self._drag_ov = None
-        self._drag_original = None
+        self._drag_clips = []
+        self._drag_ref = None
+        self._drag_ref_before = None
         self._external_drag = None
+        self._marquee = None
         self._feedback = None
         self._set_status("Edit cancelled")
         self._redraw()
         return "break"
 
-    def _set_feedback(self, x, y, text, guide_ms=None, lane=None):
-        self._feedback = (x, y, text, guide_ms, lane)
+    def _set_feedback(self, x, y, text, guide_ms=None, track_index=None):
+        self._feedback = (x, y, text, guide_ms, track_index)
         self._set_status(text)
 
     def _set_status(self, text):
         if self.on_status:
             self.on_status(text)
 
+    def _set_playhead(self, ms):
+        self.playhead_ms = max(0.0, min(float(self.total_ms), float(ms)))
+        self._set_status(f"Playhead {self._fmt_precise(self.playhead_ms)}")
+        self._redraw()
+        return "break"
+
     def _on_pan_press(self, event):
-        self._pan_anchor = (event.x, self.view_start_ms)
-        self.configure(cursor="sb_h_double_arrow")
+        self._pan_anchor = (event.x, event.y, self.view_start_ms, self.scroll_y)
+        self.configure(cursor="fleur")
 
     def _on_pan_drag(self, event):
         if not self._pan_anchor:
             return
-        anchor_x, anchor_start = self._pan_anchor
-        delta_ms = (anchor_x - event.x) / self._timeline_w() * self.view_span_ms
-        self.view_start_ms = anchor_start + delta_ms
+        anchor_x, anchor_y, anchor_start, anchor_scroll = self._pan_anchor
+        self.view_start_ms = anchor_start + (anchor_x - event.x) / self._timeline_w() * self.view_span_ms
+        self.scroll_y = anchor_scroll + (anchor_y - event.y)
         self._clamp_view()
+        self._clamp_scroll_y()
         self._redraw()
 
     def _on_pan_release(self, _event):
         self._pan_anchor = None
-        self.configure(cursor="crosshair" if self.tool == "razor" else "")
+        self.configure(cursor=self.TOOL_CURSORS[self.tool])
+
+    # ---- keyboard --------------------------------------------------------
 
     def _nudge_selected(self, event, direction):
-        if self._selected_ov not in self.overrides:
+        if not self.selection:
             return "break"
-        amount = 1000 if getattr(event, "state", 0) & 0x0001 else 100
-        ov = self._selected_ov
-        source_start = self._clip_source_start(ov)
+        state = getattr(event, "state", 0)
+        amount = 1000 if state & self.SHIFT_MASK else 100
         self._begin_transaction()
-        if getattr(event, "state", 0) & self.ALT_MASK:
-            ov["source_start_ms"] = max(0, source_start + direction * amount)
+        if state & self.ALT_MASK:
+            for clip in self.selection:
+                clip["source_start_ms"] = max(0, self._clip_source_start(clip) + direction * amount)
+                clip["mode"] = self._clip_mode(clip)
             message = "Slipped clip source"
         else:
-            length = ov["end_ms"] - ov["start_ms"]
-            start = max(0, min(self.total_ms - length, ov["start_ms"] + direction * amount))
-            ov["start_ms"] = int(start)
-            ov["end_ms"] = int(start + length)
-            ov["source_start_ms"] = source_start
+            lowest = min(int(clip["start_ms"]) for clip in self.selection)
+            highest = max(int(clip["end_ms"]) for clip in self.selection)
+            delta = direction * amount
+            delta = max(-lowest, min(self.total_ms - highest, delta))
+            for clip in self.selection:
+                clip["source_start_ms"] = self._clip_source_start(clip)
+                clip["start_ms"] = int(clip["start_ms"]) + delta
+                clip["end_ms"] = int(clip["end_ms"]) + delta
+                clip["mode"] = self._clip_mode(clip)
             message = "Nudged clip"
-        ov["mode"] = self._clip_mode(ov)
         self._commit_transaction(message)
+        return "break"
+
+    def _move_selection_slots(self, direction):
+        slots = self._lane_slots()
+        if not self.selection or not slots:
+            return "break"
+        positions = [self._slot_of(clip) for clip in self.selection]
+        delta = max(-min(positions), min(len(slots) - 1 - max(positions), direction))
+        if delta == 0:
+            return "break"
+        self._begin_transaction()
+        for clip in self.selection:
+            clip["source_start_ms"] = self._clip_source_start(clip)
+            clip["mode"] = self._clip_mode(clip)
+            self._retarget(clip, *slots[self._slot_of(clip) + delta])
+        self._commit_transaction("Moved clip to another lane")
         return "break"
 
 
@@ -1100,13 +1768,20 @@ class MashupApp(tk.Tk):
         self.stems_match_loudness_var = tk.BooleanVar(value=True)
         self.stems_tempo_match_var = tk.BooleanVar(value=True)
         self.stems_auto_fallback_var = tk.BooleanVar(value=True)
-        self.stem_source_vars = {name: tk.StringVar(value=STEM_DEFAULT_SOURCE[name]) for name in STEM_NAMES}
+        # The playlist's tracks and clips. Both lists are handed to the editor
+        # by identity so canvas edits are immediately visible to the renderer.
+        self.timeline_tracks: list = [make_stem_track(name) for name in STEM_NAMES]
         self.stem_overrides: list = []
+        self._track_vars: dict = {}
+        self._imported_durations: dict = {}
+        self._syncing_clip_list = False
         self.override_tool_var = tk.StringVar(value="select")
         self.override_clip_length_var = tk.DoubleVar(value=8.0)
         self.override_clip_mode_var = tk.StringVar(value="Layer")
         self.override_snap_var = tk.BooleanVar(value=True)
-        self.override_status_var = tk.StringVar(value="Drop clips, draw in a P/S sublane, or click the ruler to move the playhead.")
+        self.override_status_var = tk.StringVar(
+            value="Draw (B) clips in a lane, drag them with Select (V), cut with Razor (R)."
+        )
 
         self.primary_duration_ms = 0
         self.secondary_duration_ms = 0
@@ -1135,6 +1810,9 @@ class MashupApp(tk.Tk):
     # ---- theme & layout scaffolding ----------------------------------
 
     def _apply_theme(self):
+        """One dark DAW-style theme for every widget: ttk styles for the
+        dashboard, option_add defaults for the plain-tk widgets (menus,
+        listboxes, dialogs) that ttk styles never reach."""
         self.configure(bg=BG)
         style = ttk.Style(self)
         try:
@@ -1143,44 +1821,93 @@ class MashupApp(tk.Tk):
             pass
 
         default_font = ("Segoe UI", 9)
-        header_font = ("Segoe UI", 10, "bold")
+        header_font = ("Segoe UI", 9, "bold")
         self.option_add("*Font", default_font)
+        self.option_add("*background", BG)
+        self.option_add("*foreground", TEXT)
+        self.option_add("*Menu.background", SURFACE_ALT)
+        self.option_add("*Menu.foreground", TEXT)
+        self.option_add("*Menu.activeBackground", ACCENT)
+        self.option_add("*Menu.activeForeground", ACCENT_TEXT)
+        self.option_add("*Menu.relief", "flat")
+        self.option_add("*TCombobox*Listbox.background", SURFACE_ALT)
+        self.option_add("*TCombobox*Listbox.foreground", TEXT)
+        self.option_add("*TCombobox*Listbox.selectBackground", ACCENT)
+        self.option_add("*TCombobox*Listbox.selectForeground", ACCENT_TEXT)
 
-        style.configure(".", background=BG, foreground=TEXT, font=default_font)
+        style.configure(".", background=BG, foreground=TEXT, font=default_font,
+                        bordercolor=BORDER, darkcolor=SURFACE, lightcolor=SURFACE,
+                        troughcolor=SURFACE, focuscolor=ACCENT)
         style.configure("TFrame", background=BG)
+        style.configure("Panel.TFrame", background=SURFACE)
         style.configure("TLabel", background=BG, foreground=TEXT)
         style.configure("Muted.TLabel", background=BG, foreground=MUTED)
         style.configure("Title.TLabel", background=BG, foreground=TEXT, font=("Segoe UI", 16, "bold"))
         style.configure("Subtitle.TLabel", background=BG, foreground=MUTED, font=("Segoe UI", 9))
+        style.configure("Section.TLabel", background=BG, foreground=ACCENT, font=("Segoe UI", 8, "bold"))
         style.configure("Success.TLabel", background=BG, foreground=SUCCESS, font=("Segoe UI", 9, "bold"))
         style.configure("Error.TLabel", background=BG, foreground=ERROR, font=("Segoe UI", 9, "bold"))
         style.configure("Working.TLabel", background=BG, foreground=ACCENT, font=("Segoe UI", 9, "bold"))
 
         style.configure("TLabelframe", background=BG, bordercolor=BORDER, relief="solid", borderwidth=1)
-        style.configure("TLabelframe.Label", background=BG, foreground=TEXT, font=header_font)
+        style.configure("TLabelframe.Label", background=BG, foreground=ACCENT, font=header_font)
         style.configure("TCheckbutton", background=BG, foreground=TEXT)
+        style.map("TCheckbutton",
+                  background=[("active", BG)],
+                  indicatorcolor=[("selected", ACCENT), ("!selected", SURFACE_ALT)])
         style.configure("TRadiobutton", background=BG, foreground=TEXT)
+        style.map("TRadiobutton",
+                  background=[("active", BG)],
+                  indicatorcolor=[("selected", ACCENT), ("!selected", SURFACE_ALT)])
 
-        style.configure("TButton", padding=(10, 6))
-        style.configure("Accent.TButton", background=ACCENT, foreground=ACCENT_TEXT, padding=(16, 9), font=("Segoe UI", 10, "bold"))
+        style.configure("TButton", padding=(10, 6), background=SURFACE_ALT, foreground=TEXT,
+                        bordercolor=BORDER_HI, relief="flat")
+        style.map("TButton",
+                  background=[("active", SURFACE_HI), ("disabled", SURFACE)],
+                  foreground=[("disabled", MUTED)])
+        style.configure("Mini.TButton", padding=(4, 2), font=("Segoe UI", 8))
+        style.map("Mini.TButton", background=[("active", SURFACE_HI)])
+        style.configure("Accent.TButton", background=ACCENT, foreground=ACCENT_TEXT,
+                        padding=(16, 9), font=("Segoe UI", 10, "bold"))
         style.map(
             "Accent.TButton",
-            background=[("active", ACCENT_ACTIVE), ("disabled", "#a9b6d6")],
-            foreground=[("disabled", "#eef1f8")],
+            background=[("active", ACCENT_ACTIVE), ("disabled", "#4a423a")],
+            foreground=[("disabled", MUTED)],
         )
 
-        style.configure("Toolbutton", padding=(10, 8), background=SURFACE, font=("Segoe UI", 9, "bold"))
+        style.configure("Toolbutton", padding=(10, 8), background=SURFACE_ALT,
+                        foreground=TEXT, font=("Segoe UI", 9, "bold"), relief="flat")
         style.map(
             "Toolbutton",
-            background=[("selected", ACCENT), ("active", "#e2e8f0")],
-            foreground=[("selected", "#ffffff")],
+            background=[("selected", ACCENT), ("active", SURFACE_HI)],
+            foreground=[("selected", ACCENT_TEXT)],
         )
 
-        style.configure("TEntry", fieldbackground=SURFACE, bordercolor=BORDER)
-        style.configure("TCombobox", fieldbackground=SURFACE)
-        style.configure("Horizontal.TScale", background=BG)
-        style.configure("Accent.Horizontal.TProgressbar", background=ACCENT, troughcolor="#e2e5eb")
+        style.configure("TEntry", fieldbackground=SURFACE_ALT, foreground=TEXT,
+                        bordercolor=BORDER_HI, insertcolor=TEXT, padding=3)
+        style.configure("TSpinbox", fieldbackground=SURFACE_ALT, foreground=TEXT,
+                        bordercolor=BORDER_HI, arrowcolor=TEXT, insertcolor=TEXT)
+        style.configure("TCombobox", fieldbackground=SURFACE_ALT, foreground=TEXT,
+                        background=SURFACE_ALT, bordercolor=BORDER_HI, arrowcolor=TEXT)
+        style.map("TCombobox",
+                  fieldbackground=[("readonly", SURFACE_ALT)],
+                  foreground=[("readonly", TEXT)],
+                  selectbackground=[("readonly", SURFACE_ALT)],
+                  selectforeground=[("readonly", TEXT)])
+        style.configure("Horizontal.TScale", background=BG, troughcolor=SURFACE_ALT)
+        style.map("Horizontal.TScale", background=[("active", BG)])
+        style.configure("TScrollbar", background=SURFACE_ALT, troughcolor=BG,
+                        bordercolor=BG, arrowcolor=MUTED, relief="flat")
+        style.map("TScrollbar", background=[("active", SURFACE_HI)])
+        style.configure("Accent.Horizontal.TProgressbar", background=ACCENT, troughcolor=SURFACE_ALT,
+                        bordercolor=BORDER, lightcolor=ACCENT, darkcolor=ACCENT)
         style.configure("TSeparator", background=BORDER)
+        style.configure("Treeview", background=SURFACE_ALT, fieldbackground=SURFACE_ALT,
+                        foreground=TEXT, bordercolor=BORDER, rowheight=20)
+        style.map("Treeview", background=[("selected", ACCENT)], foreground=[("selected", ACCENT_TEXT)])
+        style.configure("Treeview.Heading", background=SURFACE, foreground=MUTED,
+                        font=("Segoe UI", 8, "bold"), relief="flat")
+        style.map("Treeview.Heading", background=[("active", SURFACE_HI)])
 
     def _build_scroll_container(self):
         outer = ttk.Frame(self)
@@ -1455,18 +2182,8 @@ class MashupApp(tk.Tk):
     def _build_stems_frame(self):
         frame = ttk.Frame(self.mode_container)
 
-        picker = ttk.LabelFrame(frame, text=" Full-song stem bed ")
-        picker.pack(fill="x", pady=(8, 8), padx=8)
-        for row, name in enumerate(STEM_NAMES):
-            ttk.Label(picker, text=name.capitalize() + ":", width=10, anchor="w").grid(
-                row=row, column=0, sticky="w", padx=6, pady=4
-            )
-            combo = ttk.Combobox(
-                picker, textvariable=self.stem_source_vars[name], values=["Primary", "Secondary", "Both", "Muted"],
-                state="readonly", width=14,
-            )
-            combo.grid(row=row, column=1, sticky="w", padx=4, pady=4)
-            combo.bind("<<ComboboxSelected>>", lambda _e: self.stems_override_editor._redraw())
+        self._build_track_panel(frame)
+        self._build_playlist_panel(frame)
 
         self.stems_offset = LabeledScale(frame, "Secondary start offset", 0, 60000, 0, unit=" ms")
         self.stems_offset.pack(fill="x", pady=4, padx=8)
@@ -1491,122 +2208,6 @@ class MashupApp(tk.Tk):
             tooltip="Larger size = longer, more spacious reverb tail (shared by both reverb sends).",
         )
         self.stems_reverb_size.pack(fill="x", pady=4, padx=8)
-
-        override_frame = ttk.LabelFrame(frame, text=" Stem Playlist ")
-        self.stems_playlist_frame = override_frame
-        override_frame.pack(fill="x", pady=(8, 4), padx=8)
-
-        tool_row = ttk.Frame(override_frame)
-        tool_row.pack(fill="x", padx=6, pady=(6, 2))
-        ttk.Label(tool_row, text="Tool:").pack(side="left")
-        ttk.Radiobutton(
-            tool_row, text="Select / move (V)", value="select", variable=self.override_tool_var,
-            style="Toolbutton", command=lambda: self.stems_override_editor.set_tool("select"),
-        ).pack(side="left", padx=(6, 2))
-        ttk.Radiobutton(
-            tool_row, text="Razor / cut (R)", value="razor", variable=self.override_tool_var,
-            style="Toolbutton", command=lambda: self.stems_override_editor.set_tool("razor"),
-        ).pack(side="left", padx=2)
-        self.override_undo_button = ttk.Button(
-            tool_row, text="Undo", command=lambda: self.stems_override_editor.undo(), state="disabled",
-        )
-        self.override_undo_button.pack(side="right", padx=(2, 0))
-        self.override_redo_button = ttk.Button(
-            tool_row, text="Redo", command=lambda: self.stems_override_editor.redo(), state="disabled",
-        )
-        self.override_redo_button.pack(side="right", padx=2)
-
-        clip_row = ttk.Frame(override_frame)
-        clip_row.pack(fill="x", padx=6, pady=(2, 4))
-        ttk.Label(clip_row, text="Audio clips:").pack(side="left")
-        StemSourceClip(
-            clip_row, "P  PRIMARY STEM", "primary", lambda: self.stems_override_editor,
-        ).pack(side="left", padx=(6, 3))
-        StemSourceClip(
-            clip_row, "S  SECONDARY STEM", "secondary", lambda: self.stems_override_editor,
-        ).pack(side="left", padx=3)
-        ttk.Label(clip_row, text="Length:").pack(side="left", padx=(10, 3))
-        ttk.Spinbox(
-            clip_row, from_=0.25, to=3600.0, increment=0.25,
-            textvariable=self.override_clip_length_var, width=6,
-        ).pack(side="left")
-        ttk.Label(clip_row, text="sec").pack(side="left", padx=(2, 0))
-
-        behavior_row = ttk.Frame(override_frame)
-        behavior_row.pack(fill="x", padx=6, pady=(0, 3))
-        ttk.Label(behavior_row, text="New clips:").pack(side="left")
-        ttk.Radiobutton(
-            behavior_row, text="Layer (play together)", value="Layer", variable=self.override_clip_mode_var,
-        ).pack(side="left", padx=(6, 2))
-        ttk.Radiobutton(
-            behavior_row, text="Replace bed", value="Replace", variable=self.override_clip_mode_var,
-        ).pack(side="left", padx=2)
-        ttk.Checkbutton(behavior_row, text="Snap", variable=self.override_snap_var).pack(side="left", padx=(12, 0))
-        ttk.Label(behavior_row, text="Alt = fine / slip", style="Muted.TLabel").pack(side="left", padx=(3, 0))
-        ttk.Button(
-            behavior_row, text="Use full length",
-            command=lambda: self.override_clip_length_var.set(self.stems_override_editor.total_ms / 1000),
-        ).pack(side="right")
-
-        self.stems_override_editor = StemOverrideEditor(
-            override_frame, STEM_NAMES,
-            get_default_source=lambda stem: self.stem_source_vars[stem].get().lower(),
-            get_clip_length_ms=lambda: self.override_clip_length_var.get() * 1000,
-            get_clip_mode=lambda: self.override_clip_mode_var.get().lower(),
-            get_snap_enabled=self.override_snap_var.get,
-            on_change=self._refresh_override_tree,
-            on_status=self.override_status_var.set,
-            on_tool_change=self.override_tool_var.set,
-        )
-        self.stems_override_editor.pack(fill="x", padx=6, pady=(2, 0))
-        self.override_scrollbar = ttk.Scrollbar(
-            override_frame, orient="horizontal", command=self.stems_override_editor.xview,
-        )
-        self.override_scrollbar.pack(fill="x", padx=(118, 6), pady=(0, 2))
-        self.stems_override_editor.set_xscrollcommand(self.override_scrollbar.set)
-
-        view_row = ttk.Frame(override_frame)
-        view_row.pack(fill="x", padx=6, pady=(0, 2))
-        ttk.Button(view_row, text="Zoom in", command=self.stems_override_editor.zoom_in).pack(side="left")
-        ttk.Button(view_row, text="Zoom out", command=self.stems_override_editor.zoom_out).pack(side="left", padx=3)
-        ttk.Button(view_row, text="Fit song", command=self.stems_override_editor.fit_view).pack(side="left")
-        ttk.Label(view_row, textvariable=self.override_status_var, style="Muted.TLabel").pack(
-            side="left", padx=10, fill="x", expand=True,
-        )
-        ttk.Label(
-            override_frame,
-            text="Each stem has Primary (P) and Secondary (S) sublanes. Overlapping Layer clips really play "
-                 "together; Replace clips take over from the full-song bed. Drag clips horizontally or between "
-                 "stem tracks, trim their handles, and cut with Razor. Arrow keys nudge; Alt+arrows slip source "
-                 "audio; middle-drag pans; Ctrl+wheel zooms; Shift+wheel scrolls.",
-            style="Muted.TLabel", wraplength=680, justify="left",
-        ).pack(fill="x", padx=6, pady=(2, 6))
-
-        self.override_tree = ttk.Treeview(
-            override_frame, columns=("stem", "source", "mode", "start", "end", "source_start"), show="headings", height=3
-        )
-        for col, label, width in [
-            ("stem", "Stem", 70), ("source", "Source", 75), ("mode", "Mode", 70),
-            ("start", "Timeline in", 85), ("end", "Timeline out", 85), ("source_start", "Source in", 85),
-        ]:
-            self.override_tree.heading(col, text=label)
-            self.override_tree.column(col, width=width, anchor="center")
-        self.override_tree.pack(fill="x", padx=6, pady=(0, 4))
-        ttk.Button(override_frame, text="Remove Selected", command=self._remove_override).pack(
-            anchor="e", padx=6, pady=(0, 6)
-        )
-
-        ttk.Label(
-            override_frame,
-            text="Set a stem bed to Both for both tracks across the full song, or Muted for a clip-only track. "
-                 "For selected sections, place a Layer clip from the other source on its P/S sublane.",
-            style="Muted.TLabel", wraplength=680, justify="left",
-        ).pack(fill="x", padx=6, pady=(0, 6))
-
-        # The playlist is the primary stem workflow, so keep it directly
-        # below the full-song bed instead of burying it under gain/effect knobs.
-        override_frame.pack_forget()
-        override_frame.pack(fill="x", pady=(8, 4), padx=8, before=self.stems_offset)
 
         blend = self._build_blend_section(frame, title="Tempo & mix")
         check_row = ttk.Frame(blend)
@@ -1637,36 +2238,400 @@ class MashupApp(tk.Tk):
 
         note = ttk.Label(
             frame,
-            text="Both sources can now contribute the same stem at the same time. Full four-stem separation is "
-                 "slower than the vocals mode; results are cached per file.",
+            text="Both sources can contribute the same stem at the same time. Full four-stem separation is "
+                 "slower than the vocals mode; results are cached per file. Imported tracks are used as-is "
+                 "(no separation, no tempo matching).",
             style="Muted.TLabel", wraplength=680, justify="left",
         )
         note.pack(fill="x", pady=(8, 8), padx=8)
 
-        # Establishes stems_override_editor.overrides as the *same* list object
-        # as self.stem_overrides (not just an equal-valued copy), so drag edits
-        # on the canvas are immediately visible to the render worker without
-        # needing an explicit sync step.
-        self._refresh_override_tree()
+        self._refresh_track_panel()
         return frame
+
+    # ---- track management ------------------------------------------------
+
+    def _build_track_panel(self, parent):
+        panel = ttk.LabelFrame(parent, text=" Tracks ")
+        panel.pack(fill="x", pady=(8, 6), padx=8)
+
+        bar = ttk.Frame(panel)
+        bar.pack(fill="x", padx=6, pady=(6, 2))
+        add_button = ttk.Button(bar, text="+ Stem track", command=self._popup_add_stem_menu)
+        add_button.pack(side="left")
+        self._tip(add_button, "Adds another lane fed by one separated stem - handy for stacking clips.")
+        import_button = ttk.Button(bar, text="Import audio...", command=self._import_audio_track)
+        import_button.pack(side="left", padx=6)
+        self._tip(import_button, "Brings any audio file in as its own playlist track.")
+        ttk.Label(
+            bar, text="Right-click a track header on the timeline for the same commands.",
+            style="Muted.TLabel",
+        ).pack(side="left", padx=8)
+
+        self.track_rows = ttk.Frame(panel)
+        self.track_rows.pack(fill="x", padx=6, pady=(0, 6))
+        return panel
+
+    def _popup_add_stem_menu(self):
+        menu = tk.Menu(self, tearoff=0, bg=SURFACE_ALT, fg=TEXT,
+                       activebackground=ACCENT, activeforeground=ACCENT_TEXT, bd=0)
+        for name in STEM_NAMES:
+            menu.add_command(label=name.capitalize(), command=lambda stem=name: self._add_stem_track(stem))
+        try:
+            menu.tk_popup(self.winfo_pointerx(), self.winfo_pointery())
+        finally:
+            menu.grab_release()
+
+    def _add_stem_track(self, stem):
+        # Extra stem lanes default to a muted bed: a second full-song bed for
+        # the same stem would just double that stem's level.
+        track = make_stem_track(stem, name=self._unique_track_name(stem.capitalize()), bed="muted")
+        self.timeline_tracks.append(track)
+        self.playlist_editor.active_track_id = track["id"]
+        self._refresh_track_panel()
+        self.override_status_var.set(f"Added track '{track['name']}'")
+
+    def _import_audio_track(self):
+        path = filedialog.askopenfilename(
+            title="Import audio into the playlist", initialdir=self.last_source_dir,
+            filetypes=[("Audio files", "*.mp3 *.wav *.flac *.ogg *.m4a *.aac"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        from . import audio_io
+
+        try:
+            duration_ms = audio_io.get_duration_ms(path)
+        except Exception as exc:  # noqa: BLE001 - a bad file should not kill the app
+            messagebox.showerror("Can't import audio", f"{Path(path).name}\n\n{exc}")
+            return
+        track = make_audio_track(path, name=self._unique_track_name(Path(path).stem[:20]))
+        self._imported_durations[track["id"]] = duration_ms
+        self.timeline_tracks.append(track)
+        self.playlist_editor.active_track_id = track["id"]
+        self._remember_source_dir(path)
+        self._refresh_track_panel()
+        self._update_timelines()
+        self.override_status_var.set(
+            f"Imported '{track['name']}' ({PlaylistEditor._fmt(duration_ms)}) - drag the AUDIO chip onto its lane"
+        )
+
+    def _duplicate_track(self, track):
+        """Copy a track and its clips. The copy is clip-only (muted bed) so it
+        layers on top of the original instead of doubling its full-song bed."""
+        copy = dict(track)
+        copy["id"] = _new_track_id()
+        copy["name"] = self._unique_track_name(track["name"])
+        copy["bed"] = "muted"
+        copy["solo"] = False
+        index = self.timeline_tracks.index(track) + 1
+        self.timeline_tracks.insert(index, copy)
+        if track["id"] in self._imported_durations:
+            self._imported_durations[copy["id"]] = self._imported_durations[track["id"]]
+        cloned = [dict(clip, track=copy["id"]) for clip in self.stem_overrides if clip.get("track") == track["id"]]
+        if cloned:
+            self.playlist_editor._begin_transaction()
+            self.stem_overrides.extend(cloned)
+            self.playlist_editor._commit_transaction(f"Duplicated track '{track['name']}'")
+        self.playlist_editor.active_track_id = copy["id"]
+        self._refresh_track_panel()
+        self.override_status_var.set(
+            f"Duplicated '{track['name']}' as '{copy['name']}' with {len(cloned)} clip(s)"
+        )
+
+    def _remove_track(self, track):
+        if len(self.timeline_tracks) <= 1:
+            messagebox.showinfo("Can't remove track", "The playlist needs at least one track.")
+            return
+        clips = [clip for clip in self.stem_overrides if clip.get("track") == track["id"]]
+        if clips and not messagebox.askyesno(
+            "Remove track", f"Remove '{track['name']}' and its {len(clips)} clip(s)?"
+        ):
+            return
+        if clips:
+            self.playlist_editor._begin_transaction()
+            self.stem_overrides[:] = [
+                clip for clip in self.stem_overrides if clip.get("track") != track["id"]
+            ]
+            self.playlist_editor._commit_transaction(f"Removed track '{track['name']}'")
+        self.timeline_tracks.remove(track)
+        self._imported_durations.pop(track["id"], None)
+        self.playlist_editor.selection = []
+        self._refresh_track_panel()
+        self._update_timelines()
+        self.override_status_var.set(f"Removed track '{track['name']}'")
+
+    def _rename_track(self, track):
+        from tkinter import simpledialog
+
+        name = simpledialog.askstring("Rename track", "Track name:", initialvalue=track["name"], parent=self)
+        if name:
+            track["name"] = name.strip()[:24] or track["name"]
+            self._refresh_track_panel()
+
+    def _unique_track_name(self, base):
+        existing = {track["name"] for track in self.timeline_tracks}
+        if base not in existing:
+            return base
+        for suffix in range(2, 100):
+            candidate = f"{base} {suffix}"
+            if candidate not in existing:
+                return candidate
+        return base
+
+    def _on_track_command(self, action, track):
+        """Commands raised from the timeline's own track headers."""
+        if action.startswith("bed:"):
+            track["bed"] = action.split(":", 1)[1]
+            self._refresh_track_panel()
+        elif action == "duplicate":
+            self._duplicate_track(track)
+        elif action == "remove":
+            self._remove_track(track)
+        elif action == "rename":
+            self._rename_track(track)
+        else:  # mute / solo, already toggled on the track dict by the canvas
+            self._refresh_track_panel()
+
+    def _refresh_track_panel(self):
+        """Rebuild the per-track control rows and re-sync the timeline. Cheap
+        enough to redo wholesale, and it keeps the rows honest after add,
+        duplicate, remove, rename and reorder."""
+        for child in self.track_rows.winfo_children():
+            child.destroy()
+        self._track_vars = {}
+
+        header = ttk.Frame(self.track_rows)
+        header.pack(fill="x", pady=(2, 0))
+        for text, width in (("Track", 18), ("Full-song bed", 15), ("Gain", 8)):
+            ttk.Label(header, text=text, width=width, anchor="w", style="Section.TLabel").pack(side="left", padx=2)
+
+        for track in self.timeline_tracks:
+            self._build_track_row(track)
+
+        self.playlist_editor.set_tracks(self.timeline_tracks)
+        self._refresh_clip_list()
+
+    def _build_track_row(self, track):
+        row = ttk.Frame(self.track_rows)
+        row.pack(fill="x", pady=1)
+
+        name_var = tk.StringVar(value=track["name"])
+        bed_var = tk.StringVar(value=track["bed"].capitalize())
+        gain_var = tk.DoubleVar(value=float(track.get("gain_db", 0.0)))
+        mute_var = tk.BooleanVar(value=bool(track.get("mute")))
+        solo_var = tk.BooleanVar(value=bool(track.get("solo")))
+        self._track_vars[track["id"]] = (name_var, bed_var, gain_var, mute_var, solo_var)
+
+        name_entry = ttk.Entry(row, textvariable=name_var, width=18)
+        name_entry.pack(side="left", padx=2)
+        name_var.trace_add("write", lambda *_a: self._write_track_name(track, name_var))
+
+        beds = ["Import", "Muted"] if track["kind"] == "audio" else ["Primary", "Secondary", "Both", "Muted"]
+        bed_combo = ttk.Combobox(row, textvariable=bed_var, values=beds, state="readonly", width=13)
+        bed_combo.pack(side="left", padx=2)
+        bed_combo.bind("<<ComboboxSelected>>", lambda _e: self._write_track_bed(track, bed_var))
+
+        gain_spin = ttk.Spinbox(row, from_=-20.0, to=6.0, increment=0.5, textvariable=gain_var, width=6)
+        gain_spin.pack(side="left", padx=2)
+        gain_var.trace_add("write", lambda *_a: self._write_track_gain(track, gain_var))
+
+        ttk.Checkbutton(
+            row, text="M", variable=mute_var, style="Toolbutton", width=2,
+            command=lambda: self._write_track_flag(track, "mute", mute_var),
+        ).pack(side="left", padx=(6, 1))
+        ttk.Checkbutton(
+            row, text="S", variable=solo_var, style="Toolbutton", width=2,
+            command=lambda: self._write_track_flag(track, "solo", solo_var),
+        ).pack(side="left", padx=1)
+
+        ttk.Button(
+            row, text="Duplicate", style="Mini.TButton", command=lambda: self._duplicate_track(track),
+        ).pack(side="left", padx=(8, 2))
+        ttk.Button(
+            row, text="Remove", style="Mini.TButton", command=lambda: self._remove_track(track),
+        ).pack(side="left", padx=2)
+        kind = "audio file" if track["kind"] == "audio" else f"{track['stem']} stem"
+        ttk.Label(row, text=kind, style="Muted.TLabel").pack(side="left", padx=8)
+
+    def _write_track_name(self, track, var):
+        track["name"] = var.get()[:24]
+        self.playlist_editor._redraw()
+
+    def _write_track_bed(self, track, var):
+        track["bed"] = var.get().lower()
+        self.playlist_editor._redraw()
+        self._update_timelines()
+
+    def _write_track_gain(self, track, var):
+        try:
+            track["gain_db"] = float(var.get())
+        except (tk.TclError, ValueError):
+            return
+        self.playlist_editor._redraw()
+
+    def _write_track_flag(self, track, key, var):
+        track[key] = bool(var.get())
+        self.playlist_editor._redraw()
+
+    # ---- playlist panel --------------------------------------------------
+
+    def _build_playlist_panel(self, parent):
+        panel = ttk.LabelFrame(parent, text=" Playlist ")
+        self.stems_playlist_frame = panel
+        panel.pack(fill="x", pady=(0, 6), padx=8)
+
+        tool_row = ttk.Frame(panel)
+        tool_row.pack(fill="x", padx=6, pady=(6, 2))
+        ttk.Label(tool_row, text="Tool:").pack(side="left")
+        for label, value in (("Select (V)", "select"), ("Draw (B)", "draw"), ("Razor (R)", "razor")):
+            ttk.Radiobutton(
+                tool_row, text=label, value=value, variable=self.override_tool_var,
+                style="Toolbutton", command=lambda v=value: self.playlist_editor.set_tool(v),
+            ).pack(side="left", padx=2)
+        self.override_undo_button = ttk.Button(
+            tool_row, text="Undo", command=lambda: self.playlist_editor.undo(), state="disabled",
+        )
+        self.override_undo_button.pack(side="right", padx=(2, 0))
+        self.override_redo_button = ttk.Button(
+            tool_row, text="Redo", command=lambda: self.playlist_editor.redo(), state="disabled",
+        )
+        self.override_redo_button.pack(side="right", padx=2)
+
+        clip_row = ttk.Frame(panel)
+        clip_row.pack(fill="x", padx=6, pady=(2, 4))
+        ttk.Label(clip_row, text="Drag in:").pack(side="left")
+        for text, source in (("P  PRIMARY", "primary"), ("S  SECONDARY", "secondary"), ("A  AUDIO", "import")):
+            SourceChip(clip_row, text, source, lambda: self.playlist_editor).pack(side="left", padx=3)
+        ttk.Label(clip_row, text="Length:").pack(side="left", padx=(10, 3))
+        ttk.Spinbox(
+            clip_row, from_=0.25, to=3600.0, increment=0.25,
+            textvariable=self.override_clip_length_var, width=6,
+        ).pack(side="left")
+        ttk.Label(clip_row, text="sec").pack(side="left", padx=(2, 0))
+        ttk.Button(
+            clip_row, text="Use full length", style="Mini.TButton",
+            command=lambda: self.override_clip_length_var.set(self.playlist_editor.total_ms / 1000),
+        ).pack(side="left", padx=6)
+
+        behavior_row = ttk.Frame(panel)
+        behavior_row.pack(fill="x", padx=6, pady=(0, 3))
+        ttk.Label(behavior_row, text="New clips:").pack(side="left")
+        ttk.Radiobutton(
+            behavior_row, text="Layer (play together)", value="Layer", variable=self.override_clip_mode_var,
+        ).pack(side="left", padx=(6, 2))
+        ttk.Radiobutton(
+            behavior_row, text="Replace bed", value="Replace", variable=self.override_clip_mode_var,
+        ).pack(side="left", padx=2)
+        ttk.Checkbutton(behavior_row, text="Snap", variable=self.override_snap_var).pack(side="left", padx=(12, 0))
+        ttk.Label(behavior_row, text="Alt = fine / slip / drag-a-copy", style="Muted.TLabel").pack(
+            side="left", padx=(3, 0)
+        )
+
+        canvas_row = ttk.Frame(panel)
+        canvas_row.pack(fill="x", padx=6, pady=(2, 0))
+        self.playlist_editor = PlaylistEditor(
+            canvas_row,
+            get_clip_length_ms=lambda: self.override_clip_length_var.get() * 1000,
+            get_clip_mode=lambda: self.override_clip_mode_var.get().lower(),
+            get_snap_enabled=self.override_snap_var.get,
+            on_change=self._refresh_clip_list,
+            on_status=self.override_status_var.set,
+            on_tool_change=self.override_tool_var.set,
+            on_track_command=self._on_track_command,
+        )
+        self.playlist_vscroll = ttk.Scrollbar(canvas_row, orient="vertical", command=self.playlist_editor.yview)
+        self.playlist_vscroll.pack(side="right", fill="y")
+        self.playlist_editor.pack(side="left", fill="x", expand=True)
+        self.playlist_editor.set_yscrollcommand(self.playlist_vscroll.set)
+
+        self.override_scrollbar = ttk.Scrollbar(panel, orient="horizontal", command=self.playlist_editor.xview)
+        self.override_scrollbar.pack(fill="x", padx=(PlaylistEditor.HEADER_W + 6, 22), pady=(0, 2))
+        self.playlist_editor.set_xscrollcommand(self.override_scrollbar.set)
+
+        view_row = ttk.Frame(panel)
+        view_row.pack(fill="x", padx=6, pady=(0, 2))
+        ttk.Button(view_row, text="Zoom in", style="Mini.TButton",
+                   command=self.playlist_editor.zoom_in).pack(side="left")
+        ttk.Button(view_row, text="Zoom out", style="Mini.TButton",
+                   command=self.playlist_editor.zoom_out).pack(side="left", padx=3)
+        ttk.Button(view_row, text="Fit song", style="Mini.TButton",
+                   command=self.playlist_editor.fit_view).pack(side="left")
+        ttk.Button(view_row, text="Duplicate clip", style="Mini.TButton",
+                   command=lambda: self.playlist_editor.duplicate_selection()).pack(side="left", padx=(10, 3))
+        ttk.Button(view_row, text="Split at playhead", style="Mini.TButton",
+                   command=lambda: self.playlist_editor.split_at_playhead()).pack(side="left")
+        ttk.Label(view_row, textvariable=self.override_status_var, style="Muted.TLabel").pack(
+            side="left", padx=10, fill="x", expand=True,
+        )
+
+        ttk.Label(
+            panel,
+            text="Every track plays whatever its lanes feed it: stem tracks have Primary (P) and Secondary (S) "
+                 "sublanes, imported tracks a single Audio (A) lane, so dragging a clip onto another track "
+                 "re-sources it. Overlapping Layer clips really play together; Replace clips take over from the "
+                 "full-song bed. Select (V) drags clips and marquee-selects empty space, Draw (B) paints new "
+                 "clips, Razor (R) splits. Ctrl+D duplicates, Alt-drag drags a copy, Ctrl+C/X/V copy-paste at "
+                 "the playhead, S splits there. Arrows nudge, Alt+arrows slip source audio, up/down move lanes, "
+                 "middle-drag pans, Ctrl+wheel zooms, wheel scrolls tracks. Right-click for the full menu.",
+            style="Muted.TLabel", wraplength=680, justify="left",
+        ).pack(fill="x", padx=6, pady=(2, 6))
+
+        self.override_tree = ttk.Treeview(
+            panel, columns=("track", "source", "mode", "start", "end", "source_start"),
+            show="headings", height=3,
+        )
+        for col, label, width in [
+            ("track", "Track", 90), ("source", "Lane", 70), ("mode", "Mode", 70),
+            ("start", "Timeline in", 85), ("end", "Timeline out", 85), ("source_start", "Source in", 85),
+        ]:
+            self.override_tree.heading(col, text=label)
+            self.override_tree.column(col, width=width, anchor="center")
+        self.override_tree.pack(fill="x", padx=6, pady=(0, 4))
+        self.override_tree.bind("<<TreeviewSelect>>", self._select_clips_from_list)
+        ttk.Button(panel, text="Remove Selected", command=self._remove_override).pack(
+            anchor="e", padx=6, pady=(0, 6)
+        )
+        return panel
 
     def _remove_override(self):
         selected = self.override_tree.selection()
-        self.stems_override_editor.delete_indices([int(iid) for iid in selected])
+        self.playlist_editor.delete_indices([int(iid) for iid in selected])
 
-    def _refresh_override_tree(self):
-        self.override_tree.delete(*self.override_tree.get_children())
-        for i, ov in enumerate(self.stem_overrides):
-            self.override_tree.insert(
-                "", "end", iid=str(i),
-                values=(
-                    ov["stem"], ov["source"].capitalize(), ov.get("mode", "replace").capitalize(),
-                    ov["start_ms"], ov["end_ms"], ov.get("source_start_ms", ov["start_ms"]),
-                ),
-            )
-        self.stems_override_editor.set_overrides(self.stem_overrides)
-        self.override_undo_button.configure(state="normal" if self.stems_override_editor.can_undo else "disabled")
-        self.override_redo_button.configure(state="normal" if self.stems_override_editor.can_redo else "disabled")
+    def _select_clips_from_list(self, _event=None):
+        # Rebuilding the list clears its own selection, which would otherwise
+        # wipe the canvas selection after every edit.
+        if self._syncing_clip_list:
+            return
+        indices = [int(iid) for iid in self.override_tree.selection()]
+        self.playlist_editor.selection = [
+            self.stem_overrides[i] for i in indices if 0 <= i < len(self.stem_overrides)
+        ]
+        self.playlist_editor._redraw()
+
+    def _track_name_for(self, clip):
+        for track in self.timeline_tracks:
+            if track["id"] == clip.get("track"):
+                return track["name"]
+        return clip.get("stem") or "?"
+
+    def _refresh_clip_list(self):
+        self._syncing_clip_list = True
+        try:
+            self.override_tree.delete(*self.override_tree.get_children())
+            for i, clip in enumerate(self.stem_overrides):
+                self.override_tree.insert(
+                    "", "end", iid=str(i),
+                    values=(
+                        self._track_name_for(clip), clip.get("source", "primary").capitalize(),
+                        clip.get("mode", "replace").capitalize(),
+                        clip["start_ms"], clip["end_ms"], clip.get("source_start_ms", clip["start_ms"]),
+                    ),
+                )
+        finally:
+            self._syncing_clip_list = False
+        self.playlist_editor.set_clips(self.stem_overrides)
+        self.override_undo_button.configure(state="normal" if self.playlist_editor.can_undo else "disabled")
+        self.override_redo_button.configure(state="normal" if self.playlist_editor.can_redo else "disabled")
 
     def _build_output_row(self):
         frame = ttk.LabelFrame(self.content, text=" Output ")
@@ -1782,8 +2747,21 @@ class MashupApp(tk.Tk):
 
     def _update_timelines(self):
         self.shared_timeline.set_durations(self.primary_duration_ms, self.secondary_duration_ms)
-        total = max(self.primary_duration_ms, self.stems_offset.get() + self.secondary_duration_ms, 1000)
-        self.stems_override_editor.set_total_ms(total)
+        self.playlist_editor.set_total_ms(self._timeline_total_ms())
+
+    def _timeline_total_ms(self):
+        """How long the playlist runs: the two songs, plus any imported track
+        that plays as a full-song bed, plus whatever clips reach past them."""
+        candidates = [
+            1000,
+            self.primary_duration_ms,
+            self.stems_offset.get() + self.secondary_duration_ms,
+        ]
+        for track in self.timeline_tracks:
+            if track["kind"] == "audio" and track["bed"] != "muted":
+                candidates.append(self._imported_durations.get(track["id"], 0))
+        candidates.extend(int(clip["end_ms"]) for clip in self.stem_overrides)
+        return int(max(candidates))
 
     def _on_output_path_edited(self, *_args):
         if self._setting_output_programmatically:
@@ -1874,6 +2852,16 @@ class MashupApp(tk.Tk):
     def _queue_status(self, message: str):
         self.render_queue.put(("status", message))
 
+    def _stem_source_map(self):
+        """The per-stem bed the sidechain duck triggers off: the first stem
+        track that actually plays a full-song bed for that stem."""
+        mapping = {}
+        for track in self.timeline_tracks:
+            if track["kind"] != "stem" or track.get("mute") or track["bed"] == "muted":
+                continue
+            mapping.setdefault(track["stem"], track["bed"])
+        return {name: mapping.get(name, "muted") for name in STEM_NAMES}
+
     def _render_worker(self):
         from . import audio_io
 
@@ -1933,12 +2921,12 @@ class MashupApp(tk.Tk):
                     progress_callback=self._queue_status,
                 )
             else:  # MODE_STEMS
-                stem_sources = {name: var.get().lower() for name, var in self.stem_source_vars.items()}
                 segment = mixer.stem_mix(
                     self.primary_path.get(),
                     self.secondary_path.get(),
-                    stem_sources=stem_sources,
-                    stem_overrides=list(self.stem_overrides),
+                    stem_sources=self._stem_source_map(),
+                    stem_overrides=[dict(clip) for clip in self.stem_overrides],
+                    timeline_tracks=[dict(track) for track in self.timeline_tracks],
                     offset_ms=int(self.stems_offset.get()),
                     primary_gain_db=self.stems_primary_gain.get(),
                     secondary_gain_db=self.stems_secondary_gain.get(),
