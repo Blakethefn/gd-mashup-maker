@@ -38,6 +38,41 @@ def get_duration_ms(path: str) -> int:
         return len(load_audio(path))
 
 
+def waveform_peaks(path: str, bins: int = 2400) -> tuple[list[tuple[float, float]], int]:
+    """Return display-ready min/max peaks for an audio file.
+
+    The timeline only needs a few thousand vertical samples, not the full
+    decoded waveform.  Reducing it here keeps canvas redraws cheap and makes
+    one cached result useful at every zoom level.
+    """
+    segment = load_audio(path)
+    duration_ms = len(segment)
+    samples = segment.get_array_of_samples()
+    if not samples:
+        return [], duration_ms
+
+    values = np.asarray(samples, dtype=np.float32)
+    channels = max(1, int(segment.channels))
+    if channels > 1:
+        usable = len(values) - (len(values) % channels)
+        values = values[:usable].reshape(-1, channels).mean(axis=1)
+    if values.size == 0:
+        return [], duration_ms
+
+    peak = float(np.max(np.abs(values)))
+    if peak <= 0:
+        return [(0.0, 0.0)], duration_ms
+    values /= peak
+
+    count = max(1, min(int(bins), int(values.size)))
+    edges = np.linspace(0, values.size, count + 1, dtype=np.int64)
+    reduced = []
+    for start, end in zip(edges[:-1], edges[1:]):
+        window = values[start:max(start + 1, end)]
+        reduced.append((float(np.min(window)), float(np.max(window))))
+    return reduced, duration_ms
+
+
 def export_mp3(segment: AudioSegment, path: str, bitrate: str = "320k") -> None:
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     segment.export(path, format="mp3", bitrate=bitrate)
