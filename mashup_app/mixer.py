@@ -18,6 +18,7 @@ def simple_overlay(
     duck_amount: float = 0.3,
     reverb_amount: float = 0.0,
     reverb_size: float = 0.5,
+    primary_reverb_amount: float = 0.0,
     progress_callback: Optional[Callable[[str], None]] = None,
 ) -> AudioSegment:
     """Layer secondary onto primary at a fixed offset, no tempo/key analysis."""
@@ -35,6 +36,11 @@ def simple_overlay(
         # Keeps secondary's bass from fighting primary's bass, the most
         # common cause of two full tracks just sounding stacked/muddy.
         secondary = secondary.high_pass_filter(120)
+
+    if primary_reverb_amount > 0:
+        if progress_callback:
+            progress_callback("Adding reverb to primary...")
+        primary = mastering.add_reverb(primary, room_size=reverb_size, wet_level=primary_reverb_amount)
 
     if reverb_amount > 0:
         if progress_callback:
@@ -70,6 +76,7 @@ def beat_synced_blend(
     duck_amount: float = 0.3,
     reverb_amount: float = 0.0,
     reverb_size: float = 0.5,
+    primary_reverb_amount: float = 0.0,
     progress_callback: Optional[Callable[[str], None]] = None,
 ) -> AudioSegment:
     """Tempo-match secondary to primary's BPM, then crossfade from primary into
@@ -100,6 +107,11 @@ def beat_synced_blend(
 
     if low_cut_secondary:
         secondary = secondary.high_pass_filter(120)
+
+    if primary_reverb_amount > 0:
+        if progress_callback:
+            progress_callback("Adding reverb to primary...")
+        primary = mastering.add_reverb(primary, room_size=reverb_size, wet_level=primary_reverb_amount)
 
     if reverb_amount > 0:
         if progress_callback:
@@ -144,6 +156,7 @@ def vocals_over_instrumental(
     duck_amount: float = 0.5,
     reverb_amount: float = 0.0,
     reverb_size: float = 0.5,
+    instrumental_reverb_amount: float = 0.0,
     progress_callback: Optional[Callable[[str], None]] = None,
 ) -> AudioSegment:
     """Separate both sources, take vocals from one and the instrumental from the
@@ -188,6 +201,13 @@ def vocals_over_instrumental(
         if progress_callback:
             progress_callback("Carving vocal presence out of instrumental...")
         instrumental_segment = mastering.carve_for_vocal(instrumental_segment)
+
+    if instrumental_reverb_amount > 0:
+        if progress_callback:
+            progress_callback("Adding reverb to instrumental...")
+        instrumental_segment = mastering.add_reverb(
+            instrumental_segment, room_size=reverb_size, wet_level=instrumental_reverb_amount
+        )
 
     if reverb_amount > 0:
         if progress_callback:
@@ -254,13 +274,37 @@ def _resolve_regions(default_source: str, overrides: list, total_len_ms: int) ->
 
 def _build_stem_track(
     default_source: str, overrides: list, primary_segment: AudioSegment, secondary_segment: AudioSegment,
-    total_len_ms: int,
+    total_len_ms: int, crossfade_ms: int = 900,
 ) -> AudioSegment:
+    """Concatenate the source regions for one stem, crossfading at every point
+    the source actually changes (whether from an explicit override or the
+    auto-fallback below) instead of hard-cutting - a straight concatenation
+    there is an instant volume/timbre jump. The crossfade window is split
+    evenly across the two neighboring regions so the stem's total length
+    still lands exactly on total_len_ms, keeping it aligned with every other
+    stem's timeline when they're all overlaid together.
+    """
     regions = _resolve_regions(default_source, overrides, total_len_ms)
+
+    def src_for(source: str) -> AudioSegment:
+        return primary_segment if source == "primary" else secondary_segment
+
     result = AudioSegment.silent(duration=0, frame_rate=primary_segment.frame_rate)
+    prev = None  # (start, end, source)
     for start, end, source in regions:
-        src = primary_segment if source == "primary" else secondary_segment
-        result += src[start:end]
+        seg_start = start
+        if prev is not None and prev[2] != source:
+            prev_start, prev_end, prev_source = prev
+            half = min(crossfade_ms, end - start, prev_end - prev_start) // 2
+            if half > 0:
+                b = start
+                result = result[: len(result) - half]
+                outgoing = src_for(prev_source)[b - half:b + half].fade_out(2 * half)
+                incoming = src_for(source)[b - half:b + half].fade_in(2 * half)
+                result += outgoing.overlay(incoming)
+                seg_start = start + half
+        result += src_for(source)[seg_start:end]
+        prev = (start, end, source)
     return result
 
 
@@ -277,6 +321,9 @@ def stem_mix(
     duck_amount: float = 0.3,
     reverb_amount: float = 0.0,
     reverb_size: float = 0.5,
+    primary_reverb_amount: float = 0.0,
+    auto_fallback: bool = True,
+    override_crossfade_ms: int = 900,
     progress_callback: Optional[Callable[[str], None]] = None,
 ) -> AudioSegment:
     """Separate both tracks into vocals/drums/bass/other, pick each stem's
@@ -287,6 +334,15 @@ def stem_mix(
     window, e.g. [{"stem": "bass", "start_ms": 30000, "end_ms": 60000,
     "source": "secondary"}] plays secondary's bass just for that 30s section
     and the default elsewhere - so a single stem can switch source mid-song.
+
+    auto_fallback (default on) additionally swaps a stem back to whichever
+    source is still playing once its own default source's audio has ended -
+    without it, a stem sourced from the shorter track goes silent for the
+    remainder of the song once that track runs out (e.g. secondary supplying
+    vocals+drums ends early, and primary's bass+other alone for the rest of
+    the song sounds thin/muffled since nothing ever fills back in for them).
+    Every source switch, explicit or automatic, is crossfaded over
+    override_crossfade_ms instead of cut hard.
     """
     import librosa
 
@@ -336,6 +392,14 @@ def stem_mix(
     primary_stems = {n: s.apply_gain(primary_adjust + primary_gain_db) for n, s in primary_stems.items()}
     secondary_stems = {n: s.apply_gain(secondary_adjust + secondary_gain_db) for n, s in secondary_stems.items()}
 
+    if primary_reverb_amount > 0:
+        if progress_callback:
+            progress_callback("Adding reverb to primary's stems...")
+        primary_stems = {
+            n: mastering.add_reverb(s, room_size=reverb_size, wet_level=primary_reverb_amount)
+            for n, s in primary_stems.items()
+        }
+
     if reverb_amount > 0:
         if progress_callback:
             progress_callback("Adding reverb to secondary's stems...")
@@ -344,12 +408,32 @@ def stem_mix(
             for n, s in secondary_stems.items()
         }
 
-    total_len = max(
-        max((len(s) for s in primary_stems.values()), default=0),
-        max((len(s) for s in secondary_stems.values()), default=0),
-    )
+    # Each source's real content length, captured before padding either one
+    # out to match the other - the point where the shorter source's audio
+    # actually stops, used below to auto-fallback stems once their source runs out.
+    primary_content_end = max((len(s) for s in primary_stems.values()), default=0)
+    secondary_content_end = max((len(s) for s in secondary_stems.values()), default=0)
+    total_len = max(primary_content_end, secondary_content_end)
     primary_stems = {n: _pad_to(s, total_len) for n, s in primary_stems.items()}
     secondary_stems = {n: _pad_to(s, total_len) for n, s in secondary_stems.items()}
+
+    fallback_overrides = []
+    if auto_fallback:
+        for name in separation.STEM_NAMES:
+            default = stem_sources.get(name, "primary")
+            if default == "secondary" and secondary_content_end < primary_content_end:
+                fallback_overrides.append({
+                    "stem": name, "start_ms": secondary_content_end,
+                    "end_ms": primary_content_end, "source": "primary",
+                })
+            elif default == "primary" and primary_content_end < secondary_content_end:
+                fallback_overrides.append({
+                    "stem": name, "start_ms": primary_content_end,
+                    "end_ms": secondary_content_end, "source": "secondary",
+                })
+    # Fallback regions come first so an explicit user override covering the
+    # same window still wins - _resolve_regions lets later entries win ties.
+    effective_overrides = fallback_overrides + stem_overrides
 
     if duck_amount > 0:
         if progress_callback:
@@ -375,8 +459,11 @@ def stem_mix(
     final = None
     for name in separation.STEM_NAMES:
         default_source = stem_sources.get(name, "primary")
-        overrides_for_stem = [ov for ov in stem_overrides if ov.get("stem") == name]
-        track = _build_stem_track(default_source, overrides_for_stem, primary_stems[name], secondary_stems[name], total_len)
+        overrides_for_stem = [ov for ov in effective_overrides if ov.get("stem") == name]
+        track = _build_stem_track(
+            default_source, overrides_for_stem, primary_stems[name], secondary_stems[name], total_len,
+            crossfade_ms=override_crossfade_ms,
+        )
         final = track if final is None else final.overlay(track)
 
     return final if final is not None else AudioSegment.silent(duration=0)
