@@ -102,13 +102,76 @@ EFFECT_SPECS = {
             ("q", "Q (bandwidth)", 0.2, 10.0, 0.1, 1.0),
         ],
     },
+    "change_pitch": {
+        "label": "Change Pitch...",
+        "help": "Shift the clip up or down without changing how long it plays.",
+        # The dialog offers notes, frequencies and percent as well, but they
+        # are all just ways of naming this one number.
+        "params": [
+            ("semitones", "Semitones (half-steps)", -24.0, 24.0, 1.0, 0.0),
+            ("high_quality", "High quality (slow): 1 = on", 0.0, 1.0, 1.0, 0.0),
+        ],
+        "summary": "{semitones:+g} st",
+    },
 }
+
+# ---- pitch arithmetic ----------------------------------------------------
+# One pitch change can be named four ways - semitones, percent, a frequency
+# ratio, or a pair of notes. These convert between them so a dialog can offer
+# all four and keep them in step.
+
+NOTE_NAMES = ("C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B")
+MIN_OCTAVE, MAX_OCTAVE = 0, 9
+
+
+def semitones_to_ratio(semitones: float) -> float:
+    return 2.0 ** (float(semitones) / 12.0)
+
+
+def semitones_to_percent(semitones: float) -> float:
+    return (semitones_to_ratio(semitones) - 1.0) * 100.0
+
+
+def percent_to_semitones(percent: float) -> float:
+    ratio = 1.0 + float(percent) / 100.0
+    if ratio <= 0:
+        return 0.0
+    return 12.0 * math.log2(ratio)
+
+
+def ratio_to_semitones(from_hz: float, to_hz: float) -> float:
+    if from_hz <= 0 or to_hz <= 0:
+        return 0.0
+    return 12.0 * math.log2(to_hz / from_hz)
+
+
+def note_to_midi(note_index: int, octave: int) -> int:
+    """MIDI number for a note, with middle C (C4) at 60."""
+    return (int(octave) + 1) * 12 + int(note_index)
+
+
+def midi_to_frequency(midi: float) -> float:
+    return 440.0 * (2.0 ** ((float(midi) - 69.0) / 12.0))
+
+
+def frequency_to_midi(hz: float) -> float:
+    if hz <= 0:
+        return 69.0
+    return 69.0 + 12.0 * math.log2(hz / 440.0)
+
+
+def midi_to_note(midi: float) -> tuple:
+    """(note_index, octave) for the nearest named note."""
+    nearest = int(round(midi))
+    return nearest % 12, nearest // 12 - 1
 
 # Effects offered as a menu, in Audacity's rough ordering.
 EFFECT_ORDER = (
     "amplify", "normalize", "compressor",
     None,
     "fade_in", "fade_out", "reverse",
+    None,
+    "change_pitch",
     None,
     "bass_treble", "filter_curve", "eq_band",
     None,
@@ -128,6 +191,14 @@ def describe(effect: dict) -> str:
     params = spec.get("params", [])
     if not params:
         return label
+    summary = spec.get("summary")
+    if summary:
+        values = {**default_params(effect.get("type")),
+                  **{k: v for k, v in effect.items() if k != "type"}}
+        try:
+            return f"{label} ({summary.format(**values)})"
+        except (KeyError, ValueError):
+            pass
     shown = ", ".join(
         f"{key.replace('_', ' ')} {float(effect.get(key, default)):g}"
         for key, _label, _lo, _hi, _step, default in params
@@ -176,13 +247,20 @@ def _stretch(segment: AudioSegment, rate: float) -> AudioSegment:
     return mastering.apply_stereo(segment, stretch_channel)
 
 
-def _shift_pitch(segment: AudioSegment, semitones: float) -> AudioSegment:
+def _shift_pitch(segment: AudioSegment, semitones: float, high_quality: bool = False) -> AudioSegment:
     if abs(semitones) <= 1e-6 or len(segment) == 0:
         return segment
     import librosa
 
     def shift_channel(y, sr):
-        return librosa.effects.pitch_shift(y, sr=sr, n_steps=semitones)
+        # res_type is only honoured by newer librosa; fall back to its default.
+        try:
+            return librosa.effects.pitch_shift(
+                y, sr=sr, n_steps=semitones,
+                res_type="soxr_hq" if high_quality else "soxr_qq",
+            )
+        except TypeError:
+            return librosa.effects.pitch_shift(y, sr=sr, n_steps=semitones)
 
     return mastering.apply_stereo(segment, shift_channel)
 
@@ -253,6 +331,10 @@ def _apply_one(segment: AudioSegment, effect: dict) -> AudioSegment:
             lambda y, sr: mastering.peaking_eq(
                 y, sr, float(params["freq"]), float(params["gain_db"]), float(params["q"])
             ),
+        )
+    if kind == "change_pitch":
+        return _shift_pitch(
+            segment, float(params["semitones"]), bool(float(params.get("high_quality", 0.0)))
         )
     return segment
 

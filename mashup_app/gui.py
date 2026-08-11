@@ -2313,6 +2313,8 @@ class MashupApp(tk.Tk):
         self._imported_durations: dict = {}
         self._syncing_clip_list = False
         self._last_effect = None
+        self._key_thread = None
+        self._pending_key_clips = []
         self.override_tool_var = tk.StringVar(value="select")
         self.override_clip_length_var = tk.DoubleVar(value=8.0)
         self.override_clip_mode_var = tk.StringVar(value="Layer")
@@ -3484,7 +3486,10 @@ class MashupApp(tk.Tk):
                 "Select a region or some clips first, then pick an effect"
             )
             return
-        params = self._ask_effect_params(effect_type)
+        params = (
+            self._ask_change_pitch() if effect_type == "change_pitch"
+            else self._ask_effect_params(effect_type)
+        )
         if params is None:
             self.playlist_editor._cancel_interaction()
             return
@@ -3652,6 +3657,272 @@ class MashupApp(tk.Tk):
         dialog.grab_set()
         self.wait_window(dialog)
 
+    # ---- pitch --------------------------------------------------------------
+
+    def _ask_change_pitch(self):
+        """Audacity's Change Pitch, which lets one pitch change be named four
+        ways - a pair of notes, a semitone count, a pair of frequencies, or a
+        percentage - and keeps all four in step as you edit any of them."""
+        dialog = tk.Toplevel(self)
+        dialog.title("Change Pitch")
+        dialog.configure(bg=BG)
+        dialog.transient(self)
+        dialog.resizable(False, False)
+
+        ttk.Label(
+            dialog,
+            text="Shifts the clip up or down without changing how long it plays. "
+                 "Set it whichever way suits: by note, by half-steps, by frequency, or by percent.",
+            style="Muted.TLabel", wraplength=430,
+        ).pack(fill="x", padx=14, pady=(14, 10))
+
+        state = {"semitones": 0.0, "from_midi": float(effects.note_to_midi(9, 4))}  # A4
+        guard = {"busy": False}
+
+        notes = list(effects.NOTE_NAMES)
+        from_note = tk.StringVar(value="A")
+        from_octave = tk.IntVar(value=4)
+        to_note = tk.StringVar(value="A")
+        to_octave = tk.IntVar(value=4)
+        semitone_var = tk.DoubleVar(value=0.0)
+        from_hz = tk.StringVar(value="440.000")
+        to_hz = tk.StringVar(value="440.000")
+        percent_var = tk.DoubleVar(value=0.0)
+        quality_var = tk.BooleanVar(value=False)
+
+        def refresh():
+            """Rewrite every field from the canonical from-pitch + semitones."""
+            guard["busy"] = True
+            try:
+                base = state["from_midi"]
+                shifted = base + state["semitones"]
+                note_index, octave = effects.midi_to_note(base)
+                from_note.set(notes[note_index])
+                from_octave.set(octave)
+                note_index, octave = effects.midi_to_note(shifted)
+                to_note.set(notes[note_index])
+                to_octave.set(max(effects.MIN_OCTAVE, min(effects.MAX_OCTAVE, octave)))
+                semitone_var.set(round(state["semitones"], 4))
+                from_frequency = effects.midi_to_frequency(base)
+                from_hz.set(f"{from_frequency:.3f}")
+                to_hz.set(f"{from_frequency * effects.semitones_to_ratio(state['semitones']):.3f}")
+                percent_var.set(round(effects.semitones_to_percent(state["semitones"]), 4))
+            finally:
+                guard["busy"] = False
+
+        def read_float(var, fallback=0.0):
+            try:
+                return float(var.get())
+            except (tk.TclError, ValueError):
+                return fallback
+
+        def on_from_note(*_a):
+            if guard["busy"]:
+                return
+            state["from_midi"] = float(
+                effects.note_to_midi(notes.index(from_note.get()), from_octave.get())
+            )
+            refresh()
+
+        def on_to_note(*_a):
+            if guard["busy"]:
+                return
+            target = effects.note_to_midi(notes.index(to_note.get()), to_octave.get())
+            state["semitones"] = target - state["from_midi"]
+            refresh()
+
+        def on_semitones(*_a):
+            if guard["busy"]:
+                return
+            state["semitones"] = max(-48.0, min(48.0, read_float(semitone_var)))
+            refresh()
+
+        def on_percent(*_a):
+            if guard["busy"]:
+                return
+            state["semitones"] = effects.percent_to_semitones(read_float(percent_var))
+            refresh()
+
+        def on_from_hz(*_a):
+            if guard["busy"]:
+                return
+            value = read_float(from_hz, 440.0)
+            if value <= 0:
+                return
+            # Keep the destination pitch, re-derive the shift from the new source.
+            target = effects.midi_to_frequency(state["from_midi"]) * effects.semitones_to_ratio(
+                state["semitones"]
+            )
+            state["from_midi"] = effects.frequency_to_midi(value)
+            state["semitones"] = effects.ratio_to_semitones(value, target)
+            refresh()
+
+        def on_to_hz(*_a):
+            if guard["busy"]:
+                return
+            value = read_float(to_hz, 440.0)
+            if value <= 0:
+                return
+            state["semitones"] = effects.ratio_to_semitones(
+                effects.midi_to_frequency(state["from_midi"]), value
+            )
+            refresh()
+
+        body = ttk.Frame(dialog)
+        body.pack(fill="x", padx=14)
+
+        pitch_box = ttk.LabelFrame(body, text=" Pitch ")
+        pitch_box.pack(fill="x", pady=(0, 8))
+        row = ttk.Frame(pitch_box)
+        row.pack(fill="x", padx=8, pady=8)
+        ttk.Label(row, text="from").pack(side="left")
+        ttk.Combobox(row, textvariable=from_note, values=notes, state="readonly",
+                     width=4).pack(side="left", padx=4)
+        ttk.Spinbox(row, from_=effects.MIN_OCTAVE, to=effects.MAX_OCTAVE, textvariable=from_octave,
+                    width=3, command=on_from_note).pack(side="left")
+        ttk.Label(row, text="   to").pack(side="left", padx=(10, 0))
+        ttk.Combobox(row, textvariable=to_note, values=notes, state="readonly",
+                     width=4).pack(side="left", padx=4)
+        ttk.Spinbox(row, from_=effects.MIN_OCTAVE, to=effects.MAX_OCTAVE, textvariable=to_octave,
+                    width=3, command=on_to_note).pack(side="left")
+
+        semis = ttk.Frame(body)
+        semis.pack(fill="x", pady=3)
+        ttk.Label(semis, text="Semitones (half-steps):", width=24, anchor="w").pack(side="left")
+        ttk.Spinbox(semis, from_=-48.0, to=48.0, increment=1.0, textvariable=semitone_var,
+                    width=10, command=on_semitones).pack(side="left")
+
+        freq_box = ttk.LabelFrame(body, text=" Frequency (Hz) ")
+        freq_box.pack(fill="x", pady=8)
+        frow = ttk.Frame(freq_box)
+        frow.pack(fill="x", padx=8, pady=8)
+        ttk.Label(frow, text="from").pack(side="left")
+        ttk.Entry(frow, textvariable=from_hz, width=11).pack(side="left", padx=4)
+        ttk.Label(frow, text="   to").pack(side="left", padx=(10, 0))
+        ttk.Entry(frow, textvariable=to_hz, width=11).pack(side="left", padx=4)
+
+        prow = ttk.Frame(body)
+        prow.pack(fill="x", pady=3)
+        ttk.Label(prow, text="Percent change:", width=24, anchor="w").pack(side="left")
+        ttk.Spinbox(prow, from_=-99.0, to=400.0, increment=1.0, textvariable=percent_var,
+                    width=10, command=on_percent).pack(side="left")
+
+        ttk.Checkbutton(body, text="Use high quality stretching (slow)",
+                        variable=quality_var).pack(anchor="w", pady=(8, 0))
+
+        for var, handler in (
+            (from_note, on_from_note), (from_octave, on_from_note),
+            (to_note, on_to_note), (to_octave, on_to_note),
+            (semitone_var, on_semitones), (percent_var, on_percent),
+            (from_hz, on_from_hz), (to_hz, on_to_hz),
+        ):
+            var.trace_add("write", handler)
+
+        chosen = {}
+
+        def confirm():
+            chosen["semitones"] = round(state["semitones"], 4)
+            chosen["high_quality"] = 1.0 if quality_var.get() else 0.0
+            dialog.destroy()
+
+        buttons = ttk.Frame(dialog)
+        buttons.pack(fill="x", padx=14, pady=(12, 14))
+        ttk.Button(buttons, text="Cancel", command=dialog.destroy).pack(side="right")
+        ok = ttk.Button(buttons, text="Apply", style="Accent.TButton", command=confirm)
+        ok.pack(side="right", padx=6)
+        dialog.bind("<Return>", lambda _e: confirm())
+        dialog.bind("<Escape>", lambda _e: dialog.destroy())
+
+        refresh()
+        dialog.update_idletasks()
+        dialog.geometry(
+            f"+{max(0, self.winfo_rootx() + (self.winfo_width() - dialog.winfo_width()) // 2)}"
+            f"+{max(0, self.winfo_rooty() + 110)}"
+        )
+        ok.focus_set()
+        dialog.grab_set()
+        self.wait_window(dialog)
+        return chosen or None
+
+    def _match_clip_pitch_to_key(self):
+        """Pitch the selected clips into the primary track's key.
+
+        Nothing in Audacity does this, but it is the pitch question a mashup
+        actually raises: the two songs are in different keys, so anything
+        borrowed from the other track clashes until it is transposed.
+        """
+        targets = list(self.playlist_editor.selection)
+        if not targets:
+            self.override_status_var.set("Select clips to match to the primary track's key")
+            return
+        if not self._validate_inputs():
+            return
+        if self._key_thread and self._key_thread.is_alive():
+            return
+        self._pending_key_clips = targets
+        self.status_label.configure(style="Working.TLabel")
+        self.status_var.set("Estimating both tracks' keys...")
+        self.override_status_var.set("Estimating keys...")
+        self._key_thread = threading.Thread(target=self._key_match_worker, daemon=True)
+        self._key_thread.start()
+
+    def _key_match_worker(self):
+        from . import analysis, audio_io
+
+        try:
+            keys = {}
+            for role, path in (("primary", self.primary_path.get()),
+                               ("secondary", self.secondary_path.get())):
+                y, sr = audio_io.load_mono_float(path)
+                keys[role] = analysis.estimate_key(y, sr)
+            extra = {}
+            for track in self.timeline_tracks:
+                if track["kind"] == "audio" and track.get("path"):
+                    y, sr = audio_io.load_mono_float(track["path"])
+                    extra[track["id"]] = analysis.estimate_key(y, sr)
+            self.render_queue.put(("keys", (keys, extra)))
+        except Exception as exc:  # noqa: BLE001 - surface any analysis failure
+            self.render_queue.put(("error", str(exc)))
+
+    def _apply_key_match(self, payload):
+        from . import analysis
+
+        keys, extra = payload
+        target_pc, target_mode = keys["primary"]
+        clips = [c for c in self._pending_key_clips if self.playlist_editor._clip_index(c) >= 0]
+        self._pending_key_clips = []
+        if not clips:
+            self.status_var.set("Those clips are gone - nothing to transpose.")
+            return
+
+        self.playlist_editor._begin_transaction()
+        moved = 0
+        for clip in clips:
+            source = clip.get("source", "primary")
+            if source == "secondary":
+                source_key = keys["secondary"][0]
+            elif source == "import":
+                index = self.playlist_editor._track_index_of(clip)
+                track_id = self.timeline_tracks[index]["id"] if index is not None else None
+                if track_id not in extra:
+                    continue
+                source_key = extra[track_id][0]
+            else:
+                continue  # already in the primary track's key
+            shift = analysis.semitone_shift_to_match(source_key, target_pc)
+            if shift:
+                clip["pitch"] = float(clip.get("pitch", 0.0) or 0.0) + shift
+                moved += 1
+        self.playlist_editor._commit_transaction(
+            f"Transposed {moved} clip(s) into {target_pc} {target_mode}"
+        )
+        secondary_pc, secondary_mode = keys["secondary"]
+        self.status_label.configure(style="Success.TLabel")
+        self.status_var.set(
+            f"Primary is {target_pc} {target_mode}, secondary is {secondary_pc} {secondary_mode}. "
+            f"Transposed {moved} clip(s)."
+        )
+
     def _build_effect_menu(self):
         menu = self._menu()
         menu.add_command(label="Repeat last effect", accelerator="Ctrl+R",
@@ -3665,6 +3936,8 @@ class MashupApp(tk.Tk):
             menu.add_command(label=spec["label"], command=lambda e=entry: self._apply_effect(e))
         menu.add_separator()
         menu.add_command(label="Clip pitch and speed...", command=self._ask_clip_speed_pitch)
+        menu.add_command(label="Match clip pitch to primary's key",
+                         command=self._match_clip_pitch_to_key)
         menu.add_command(label="Remove all effects from clips", command=self._clear_effects)
         return menu
 
@@ -4061,6 +4334,8 @@ class MashupApp(tk.Tk):
                 if kind == "status":
                     self.status_label.configure(style="Working.TLabel")
                     self.status_var.set(payload)
+                elif kind == "keys":
+                    self._apply_key_match(payload)
                 elif kind == "bpm":
                     primary_bpm, secondary_bpm = payload
                     self.bpm_label.config(text=f"Detected BPM: primary {primary_bpm:.1f}, secondary {secondary_bpm:.1f}")
