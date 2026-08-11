@@ -90,6 +90,59 @@ def _envelope(y: np.ndarray, sr: int, attack_ms: float, release_ms: float, contr
     return np.interp(full_times, control_times, env).astype(np.float32)
 
 
+def _comb_filter(y: np.ndarray, sr: int, delay_ms: float, feedback: float) -> np.ndarray:
+    from scipy.signal import lfilter
+
+    n = max(1, int(sr * delay_ms / 1000))
+    a = np.zeros(n + 1)
+    a[0] = 1.0
+    a[n] = -feedback
+    return lfilter([1.0], a, y)
+
+
+def _allpass_filter(y: np.ndarray, sr: int, delay_ms: float, feedback: float = 0.7) -> np.ndarray:
+    from scipy.signal import lfilter
+
+    n = max(1, int(sr * delay_ms / 1000))
+    b = np.zeros(n + 1)
+    b[0] = -feedback
+    b[n] = 1.0
+    a = np.zeros(n + 1)
+    a[0] = 1.0
+    a[n] = -feedback
+    return lfilter(b, a, y)
+
+
+def _schroeder_reverb(y: np.ndarray, sr: int, room_size: float, damping: float, wet_level: float) -> np.ndarray:
+    """Classic Schroeder reverberator: parallel comb filters (the room's
+    decaying echoes) feeding two series allpass filters (which diffuse the
+    echoes into a smooth tail instead of audible repeats)."""
+    comb_delays_ms = [29.7, 37.1, 41.1, 43.7]
+    feedback = min(0.95, 0.28 + 0.55 * room_size) * (1.0 - 0.3 * damping)
+
+    wet = np.zeros_like(y)
+    for delay_ms in comb_delays_ms:
+        wet += _comb_filter(y, sr, delay_ms, feedback)
+    wet /= len(comb_delays_ms)
+
+    for delay_ms in (5.0, 1.7):
+        wet = _allpass_filter(wet, sr, delay_ms)
+
+    return (1.0 - wet_level) * y + wet_level * wet
+
+
+def add_reverb(
+    segment: AudioSegment, room_size: float = 0.5, damping: float = 0.5, wet_level: float = 0.3
+) -> AudioSegment:
+    """Adds reverb so a layered-in element sounds like it's sharing the same
+    room as the rest of the mix, instead of sounding pasted on top dry.
+    room_size/damping/wet_level are all 0..1.
+    """
+    if wet_level <= 0:
+        return segment
+    return apply_stereo(segment, lambda y, sr: _schroeder_reverb(y, sr, room_size, damping, wet_level))
+
+
 def duck_segment(
     target: AudioSegment,
     trigger: AudioSegment,

@@ -13,6 +13,25 @@ def load_mp3(path: str) -> AudioSegment:
     return AudioSegment.from_file(path, format="mp3")
 
 
+def get_duration_ms(path: str) -> int:
+    """Fast duration probe via ffprobe (reads container metadata, no decode).
+
+    Falls back to a full pydub load if ffprobe is missing or fails - slower,
+    but keeps duration lookups (used to scale the GUI timeline) working even
+    without ffprobe on PATH.
+    """
+    import subprocess
+
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-show_entries", "format=duration", "-of", "csv=p=0", str(path)],
+            capture_output=True, text=True, timeout=15, check=True,
+        )
+        return int(float(result.stdout.strip()) * 1000)
+    except Exception:
+        return len(load_mp3(path))
+
+
 def export_mp3(segment: AudioSegment, path: str, bitrate: str = "320k") -> None:
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     segment.export(path, format="mp3", bitrate=bitrate)
